@@ -17,6 +17,12 @@
 #   关闭：面板强制更新
 #   开启：systemd 权限隔离，但兼容 Agent 自动更新
 #
+# 执行：
+#   bash <(curl -fsSL https://raw.githubusercontent.com/inimemail/nagen/main/install.sh)
+#
+# 非交互全部默认：
+#   NONINTERACTIVE=1 bash <(curl -fsSL https://raw.githubusercontent.com/inimemail/nagen/main/install.sh)
+#
 # 可选：
 #   DO_UPDATE=1       顺便原地升级一次 Agent
 #   NO_IOC=1          跳过 IOC 扫描清理
@@ -76,7 +82,9 @@ ask_yn(){
   fi
 
   while true; do
-    printf "%b" "${B}?${C0} ${prompt} ${suffix} " | tee -a "$LOG" >/dev/null
+    # 必须直接输出到 /dev/tty，否则 bash <(curl ...) 场景下可能看不到提示。
+    printf "%b" "${B}?${C0} ${prompt} ${suffix} " > /dev/tty
+    printf "? %s %s " "$prompt" "$suffix" >> "$LOG"
     IFS= read -r ans < /dev/tty
     printf "%s\n" "$ans" >> "$LOG"
 
@@ -269,6 +277,7 @@ restart_agent(){
 
 ask_options(){
   title "选择纯探针权限，回车使用默认值"
+  info "下面每一项都需要确认；直接回车就是默认值。"
 
   ask_yn "保留基础监控上报：CPU/内存/硬盘/流量/连接信息/在线状态？" "Y"; KEEP_REPORT=$?
   [ "$KEEP_REPORT" = "0" ] && KEEP_REPORT=1 || KEEP_REPORT=0
