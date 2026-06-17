@@ -64,19 +64,19 @@ ask_yn(){
   local ans def_word
 
   if [ "$def" = "Y" ]; then
-    def_word="默认开启"
+    def_word="开启"
   else
-    def_word="默认关闭"
+    def_word="关闭"
   fi
 
   if [ "${NONINTERACTIVE:-0}" = "1" ]; then
-    info "${icon} ${no} ${title_text} -> ${def_word}"
+    info "${icon} [${no}] ${title_text} -> 默认${def_word}"
     [ "$def" = "Y" ]
     return $?
   fi
 
   while true; do
-    printf "%b" "${icon} ${B}${no}${C0} ${title_text}  ${DIM}${def_word}${C0}  ${BLUE}[y/n/回车]${C0}: "
+    printf "%b" "${icon} ${B}[${no}]${C0} ${title_text}（默认${def_word}，回车确认）："
     read -r ans
 
     if [ -z "$ans" ]; then
@@ -85,34 +85,17 @@ ask_yn(){
     fi
 
     case "$ans" in
-      y|Y|yes|YES|Yes|是|开启|开|保留)
+      y|Y|yes|YES|Yes|1|on|ON|是|开启|开|保留|允许)
         return 0
         ;;
-      n|N|no|NO|No|否|不|不开|跳过|关闭)
+      n|N|no|NO|No|0|off|OFF|否|不|不开|跳过|关闭|禁止)
         return 1
         ;;
       *)
-        out "${YELLOW}⚠️  输入无效，请输入 y 或 n，或者直接回车。${C0}"
+        out "${YELLOW}⚠️  输入 y=开启 / n=关闭 / 回车=默认。${C0}"
         ;;
     esac
   done
-}
-download(){
-  local url="$1"
-  local dst="$2"
-  local final_url="${GH_PROXY:-}${url}"
-
-  if has curl; then
-    curl -fL --connect-timeout 20 --retry 3 --retry-delay 2 "$final_url" -o "$dst" >> "$LOG" 2>&1
-    return $?
-  fi
-
-  if has wget; then
-    wget --timeout=25 --tries=3 -O "$dst" "$final_url" >> "$LOG" 2>&1
-    return $?
-  fi
-
-  return 127
 }
 
 install_pkg(){
@@ -276,26 +259,28 @@ restart_agent(){
 
 ask_options(){
   title "🧩 纯探针权限配置"
-  out "${DIM}一路回车 = 推荐安全配置。每次只输入 y / n / 回车。${C0}"
+  out "${DIM}默认规则：01、02、03、10、11、12 开启；04-09 关闭。一路回车即可。${C0}"
+  out "${DIM}说明：04-07 在官方 Agent 里共用 disable_command_execute，一个开关控制整组远程控制能力。${C0}"
   out ""
 
   if ask_yn "01/12" "🟢" "保留基础监控上报" "Y"; then KEEP_REPORT=1; else KEEP_REPORT=0; fi
   if ask_yn "02/12" "🔄" "保留 Agent 自己自动更新" "Y"; then KEEP_AUTO_UPDATE=1; else KEEP_AUTO_UPDATE=0; fi
   if ask_yn "03/12" "🛡️" "关闭 HTTP/TCP/ICMP 主动探测" "Y"; then CLOSE_QUERY=1; else CLOSE_QUERY=0; fi
 
-  if ask_yn "04/12" "🚫" "关闭远程命令执行" "Y"; then a=1; else a=0; fi
-  if ask_yn "05/12" "🖥️" "关闭在线终端" "Y"; then b=1; else b=0; fi
-  if ask_yn "06/12" "📁" "关闭文件管理" "Y"; then c=1; else c=0; fi
-  if ask_yn "07/12" "⚙️" "关闭远程配置/任务控制" "Y"; then d=1; else d=0; fi
+  if ask_yn "04/12" "🚫" "远程命令权限" "N"; then allow_cmd=1; else allow_cmd=0; fi
+  if ask_yn "05/12" "🖥️" "在线终端权限" "N"; then allow_terminal=1; else allow_terminal=0; fi
+  if ask_yn "06/12" "📁" "文件管理权限" "N"; then allow_file=1; else allow_file=0; fi
+  if ask_yn "07/12" "⚙️" "远程配置/任务控制权限" "N"; then allow_config=1; else allow_config=0; fi
 
-  if [ "$a" = "1" ] || [ "$b" = "1" ] || [ "$c" = "1" ] || [ "$d" = "1" ]; then
-    CLOSE_REMOTE_TASKS=1
-  else
+  if [ "$allow_cmd" = "1" ] || [ "$allow_terminal" = "1" ] || [ "$allow_file" = "1" ] || [ "$allow_config" = "1" ]; then
     CLOSE_REMOTE_TASKS=0
+    warn "你开启了 04-07 中至少一项；由于官方是同一个开关，整组远程控制能力会开启。"
+  else
+    CLOSE_REMOTE_TASKS=1
   fi
 
-  if ask_yn "08/12" "🌉" "关闭 NAT 内网穿透" "Y"; then CLOSE_NAT=1; else CLOSE_NAT=0; fi
-  if ask_yn "09/12" "🔒" "关闭面板强制更新" "Y"; then CLOSE_FORCE_UPDATE=1; else CLOSE_FORCE_UPDATE=0; fi
+  if ask_yn "08/12" "🌉" "NAT 内网穿透权限" "N"; then CLOSE_NAT=0; else CLOSE_NAT=1; fi
+  if ask_yn "09/12" "🔒" "面板强制更新权限" "N"; then CLOSE_FORCE_UPDATE=0; else CLOSE_FORCE_UPDATE=1; fi
 
   if [ "${NO_SANDBOX:-0}" = "1" ]; then
     ENABLE_SANDBOX=0
@@ -307,7 +292,7 @@ ask_options(){
   if [ "$DO_UPDATE" = "1" ]; then
     info "DO_UPDATE=1：会执行一次 Agent 原地升级"
   else
-    if ask_yn "11/12" "⬆️" "现在执行一次 Agent 原地升级" "N"; then DO_UPDATE=1; else DO_UPDATE=0; fi
+    if ask_yn "11/12" "⬆️" "现在执行一次 Agent 原地升级" "Y"; then DO_UPDATE=1; else DO_UPDATE=0; fi
   fi
 
   if [ "${NO_IOC:-0}" = "1" ]; then
@@ -318,44 +303,6 @@ ask_options(){
   fi
 
   out ""
-}
-apply_config(){
-  title "📝 写入 Agent 纯探针配置"
-
-  if [ -z "$CONFIG" ] || [ ! -f "$CONFIG" ]; then
-    bad "未找到 Agent 配置文件，无法写入配置"
-    return 1
-  fi
-
-  cp -a "$CONFIG" "$CONFIG.bak.pure_probe_${TS}" 2>/dev/null
-
-  if [ "$KEEP_REPORT" = "0" ]; then
-    warn "你选择不保留基础上报，这等于停止 Agent。"
-    if ask_yn "确认停止并禁用 nezha-agent？" "N"; then
-      systemctl disable --now "$SERVICE" >> "$LOG" 2>&1
-      ok "Agent 已停止并禁用"
-      exit 0
-    else
-      KEEP_REPORT=1
-      warn "已取消停止 Agent，继续保留基础监控上报"
-    fi
-  fi
-
-  yaml_set_bool "$CONFIG" debug false
-  [ "$CLOSE_REMOTE_TASKS" = "1" ] && yaml_set_bool "$CONFIG" disable_command_execute true || yaml_set_bool "$CONFIG" disable_command_execute false
-  [ "$CLOSE_NAT" = "1" ] && yaml_set_bool "$CONFIG" disable_nat true || yaml_set_bool "$CONFIG" disable_nat false
-  [ "$CLOSE_QUERY" = "1" ] && yaml_set_bool "$CONFIG" disable_send_query true || yaml_set_bool "$CONFIG" disable_send_query false
-  [ "$KEEP_AUTO_UPDATE" = "1" ] && yaml_set_bool "$CONFIG" disable_auto_update false || yaml_set_bool "$CONFIG" disable_auto_update true
-  [ "$CLOSE_FORCE_UPDATE" = "1" ] && yaml_set_bool "$CONFIG" disable_force_update true || yaml_set_bool "$CONFIG" disable_force_update false
-
-  ok "配置已写入"
-  info "配置备份：$CONFIG.bak.pure_probe_${TS}"
-
-  {
-    echo
-    echo "--- pure probe config ---"
-    grep -E '^(debug|disable_command_execute|disable_nat|disable_send_query|disable_auto_update|disable_force_update):' "$CONFIG" 2>/dev/null || true
-  } >> "$LOG"
 }
 
 apply_systemd_sandbox(){
@@ -934,7 +881,7 @@ print_summary(){
 main(){
   need_root
 
-  out "${B}Nezha Agent 纯探针加固${C0}"
+  out "${B}Nezha Agent 纯探针加固 v5${C0}"
   out "${DIM}日志：$LOG${C0}"
 
   title "🔎 识别 Agent"
