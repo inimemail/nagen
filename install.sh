@@ -1,35 +1,57 @@
 #!/usr/bin/env bash
 # install.sh
-# Nezha Agent clean + update + harden
+# Nezha incident focused Agent cleaner / updater / hardener
 #
-# 适用场景：
-#   - 机器已经安装了哪吒 Agent
-#   - 不想手填 UUID / server / client_secret
-#   - 只想原地排查、清理、升级一次，并保留 Agent 自动更新
+# 目标：
+#   针对哪吒 Dashboard RCE / cron 下发命令事件后的 Agent 侧排查与清理。
+#
+# 设计原则：
+#   1. 尽量少误报：
+#      - 不把正常内核线程 [kworker/*] 当病毒
+#      - 不把正常内核线程 [kdevtmpfs] 当病毒
+#      - 不把 Xray 多端口监听当病毒
+#      - 不把 crontab 注释 "# (/tmp/tmp.xxx installed on ...)" 当病毒
+#      - 不因为单独出现 /tmp 就判病毒
+#
+#   2. 只自动清理高置信 IOC：
+#      - /tmp、/var/tmp、/dev/shm、/run/shm、/shm 下的：
+#        xmrig / .xmrig / kinsing / kdevtmpfsi / .kworker / kworker_u8 / kinsingwatch
+#      - cron / systemd / shell profile 中包含上述高置信 IOC 的执行项
+#
+#   3. 中风险可疑项只显示，不自动删除：
+#      - curl|bash、wget|sh、base64 -d、chmod +x /tmp、nohup /tmp 等
+#      - 这些可能是正常运维脚本，所以只提示人工确认
+#
+#   4. 哪吒 Agent 必做加固：
+#      - disable_command_execute: true
+#      - disable_nat: true
+#      - disable_auto_update: false
+#      - disable_force_update: false
 #
 # 执行：
 #   bash <(curl -fsSL https://raw.githubusercontent.com/inimemail/nagen/main/install.sh)
 #
 # 可选：
-#   NO_UPDATE=1 bash install.sh           # 不升级，只排查清理加固
-#   NO_CLEAN=1 bash install.sh            # 不清理，只升级加固排查
-#   STRICT=1 bash install.sh              # 额外禁用 Agent 主动检测任务 disable_send_query
-#   SHOW_DETAIL=1 bash install.sh         # 终端显示详细排查内容
-#   GH_PROXY='https://ghfast.top/' bash install.sh
+#   NO_UPDATE=1    跳过 Agent 升级
+#   NO_CLEAN=1     跳过高置信 IOC 自动清理
+#   STRICT=1       额外设置 disable_send_query: true
+#   SHOW_DETAIL=1  显示更多细节
+#   GH_PROXY='https://ghfast.top/'  GitHub 下载慢时使用
 #
-# 说明：
-#   - 脚本只处理 nezha-agent，不删除 Dashboard 数据库/面板目录/Docker 卷。
-#   - 会保留现有 Agent 配置里的 uuid/server/client_secret。
-#   - 会把 disable_auto_update / disable_force_update 设置为 false，保留自动更新和面板强制更新。
-#   - 会把 disable_command_execute 设置为 true，关闭远程命令/在线终端/文件管理能力。
+# 输出判断：
+#   CLEAN       未发现高置信病毒 IOC
+#   CLEANED     发现高置信病毒 IOC，已自动清理
+#   REVIEW      未发现高置信 IOC，但有中风险可疑项，需要人工确认
+#   RISK        Agent 配置存在风险，已修复
+#   ERROR       升级或识别失败
 
 set +e
 umask 077
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$PATH"
 
 TS="$(date +%F_%H%M%S)"
-LOG="/root/nezha_agent_clean_${TS}.log"
-QDIR="/root/nezha_quarantine_${TS}"
+LOG="/root/nezha_event_clean_${TS}.log"
+QDIR="/root/nezha_event_quarantine_${TS}"
 mkdir -p "$QDIR"
 
 if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
@@ -50,18 +72,14 @@ else
   BLUE=""
 fi
 
-log_raw() { printf "%b\n" "$*" >> "$LOG"; }
-out()     { printf "%b\n" "$*" | tee -a "$LOG"; }
-title()   { out ""; out "${B}${BLUE}▶ $*${C0}"; }
-ok()      { out "${GREEN}✓${C0} $*"; }
-warn()    { out "${YELLOW}!${C0} $*"; }
-bad()     { out "${RED}✗${C0} $*"; }
-info()    { out "${DIM}- $*${C0}"; }
-
-run_bg() {
-  "$@" >> "$LOG" 2>&1
-  return $?
-}
+out()   { printf "%b\n" "$*" | tee -a "$LOG"; }
+log()   { printf "%b\n" "$*" >> "$LOG"; }
+title() { out ""; out "${B}${BLUE}▶ $*${C0}"; }
+ok()    { out "${GREEN}✓${C0} $*"; }
+warn()  { out "${YELLOW}!${C0} $*"; }
+bad()   { out "${RED}✗${C0} $*"; }
+info()  { out "${DIM}- $*${C0}"; }
+has()   { command -v "$1" >/dev/null 2>&1; }
 
 need_root() {
   if [ "$(id -u)" -ne 0 ]; then
@@ -70,22 +88,18 @@ need_root() {
   fi
 }
 
-has() {
-  command -v "$1" >/dev/null 2>&1
-}
-
 download() {
   local url="$1"
-  local out="$2"
+  local out_file="$2"
   local final_url="${GH_PROXY:-}${url}"
 
   if has curl; then
-    curl -fL --connect-timeout 20 --retry 3 --retry-delay 2 "$final_url" -o "$out" >> "$LOG" 2>&1
+    curl -fL --connect-timeout 20 --retry 3 --retry-delay 2 "$final_url" -o "$out_file" >> "$LOG" 2>&1
     return $?
   fi
 
   if has wget; then
-    wget --timeout=25 --tries=3 -O "$out" "$final_url" >> "$LOG" 2>&1
+    wget --timeout=25 --tries=3 -O "$out_file" "$final_url" >> "$LOG" 2>&1
     return $?
   fi
 
@@ -111,6 +125,16 @@ install_pkg() {
   has "$pkg"
 }
 
+yaml_get() {
+  local file="$1"
+  local key="$2"
+
+  [ -f "$file" ] || return 1
+
+  grep -E "^[[:space:]]*${key}[[:space:]]*:" "$file" 2>/dev/null | head -n1 | \
+    sed -E "s/^[[:space:]]*${key}[[:space:]]*:[[:space:]]*//; s/[[:space:]]+#.*$//; s/^['\"]//; s/['\"]$//"
+}
+
 yaml_set_bool() {
   local file="$1"
   local key="$2"
@@ -125,18 +149,17 @@ yaml_set_bool() {
   fi
 }
 
-yaml_get() {
-  local file="$1"
-  local key="$2"
+# 高置信 IOC：只命中这些才判为病毒并自动清理。
+# 注意：
+#   - 不匹配正常 [kworker/0:1]
+#   - 不匹配正常 [kdevtmpfs]
+#   - .kworker 必须在 tmp/shm 路径下
+IOC_PROCESS_REGEX='(^|[[:space:]])(/shm/\.kworker[^[:space:]]*|/dev/shm/\.kworker[^[:space:]]*|/run/shm/\.kworker[^[:space:]]*|/tmp/\.kworker[^[:space:]]*|/var/tmp/\.kworker[^[:space:]]*|/tmp/kdevtmpfsi|/var/tmp/kdevtmpfsi|/dev/shm/kdevtmpfsi|/run/shm/kdevtmpfsi|/tmp/kinsing|/var/tmp/kinsing|/dev/shm/kinsing|/run/shm/kinsing|/tmp/xmrig|/var/tmp/xmrig|/dev/shm/xmrig|/run/shm/xmrig|/tmp/\.xmrig|/var/tmp/\.xmrig|/dev/shm/\.xmrig|/run/shm/\.xmrig|/tmp/kinsingwatch|/var/tmp/kinsingwatch)([[:space:]]|$)|(^|[[:space:]])(kworker_u8|kdevtmpfsi|kinsing|kinsingwatch|xmrig)([[:space:]]|$)'
 
-  [ -f "$file" ] || return 1
+IOC_LINE_REGEX='(/shm/\.kworker|/dev/shm/\.kworker|/run/shm/\.kworker|/tmp/\.kworker|/var/tmp/\.kworker|/tmp/kdevtmpfsi|/var/tmp/kdevtmpfsi|/dev/shm/kdevtmpfsi|/run/shm/kdevtmpfsi|/tmp/kinsing|/var/tmp/kinsing|/dev/shm/kinsing|/run/shm/kinsing|/tmp/xmrig|/var/tmp/xmrig|/dev/shm/xmrig|/run/shm/xmrig|/tmp/\.xmrig|/var/tmp/\.xmrig|/dev/shm/\.xmrig|/run/shm/\.xmrig|kworker_u8|kdevtmpfsi|kinsingwatch|kinsing|xmrig)'
 
-  grep -E "^[[:space:]]*${key}[[:space:]]*:" "$file" 2>/dev/null | head -n1 | \
-    sed -E "s/^[[:space:]]*${key}[[:space:]]*:[[:space:]]*//; s/[[:space:]]+#.*$//; s/^['\"]//; s/['\"]$//"
-}
-
-IOC_REGEX='(/shm/\.kworker|/dev/shm/\.kworker|/run/shm/\.kworker|/tmp/\.kworker|/var/tmp/\.kworker|kworker_u8|kdevtmpfsi|kinsing|xmrig|\.xmrig|kinsingwatch)'
-SUSP_REGEX='(/tmp/|/var/tmp/|/dev/shm/|/run/shm/|curl .*\| *sh|wget .*\| *sh|base64[[:space:]]+-d|chmod[[:space:]]+\+x .*/tmp|nohup .*/tmp|python.*http|perl.*http)'
+# 中风险：只提示，不自动删。
+SUSP_LINE_REGEX='(curl[[:space:]].*\|[[:space:]]*(sh|bash)|wget[[:space:]].*\|[[:space:]]*(sh|bash)|base64[[:space:]]+-d|chmod[[:space:]]+\+x[[:space:]]+/(tmp|var/tmp|dev/shm|run/shm)|nohup[[:space:]]+/(tmp|var/tmp|dev/shm|run/shm)|/(tmp|var/tmp|dev/shm|run/shm)/[^[:space:]]+[[:space:]]*(&|$))'
 
 SERVICE=""
 UNIT=""
@@ -145,17 +168,23 @@ CONFIG=""
 BEFORE_VER=""
 AFTER_VER=""
 
-FOUND_PROC=0
-FOUND_FILE=0
-FOUND_PERSIST=0
+FOUND_IOC_PROCESS=0
+FOUND_IOC_FILE=0
+FOUND_IOC_PERSIST=0
 FOUND_SUSP=0
+FOUND_LOW_COMMENT=0
+CONFIG_RISK=0
+CLEANED_IOC=0
 UPDATE_OK=0
 UPDATE_FAIL=0
 
-HIT_PROC="$QDIR/hit_process.txt"
-HIT_FILE="$QDIR/hit_file.txt"
-HIT_PERSIST="$QDIR/hit_persist.txt"
-HIT_SUSP="$QDIR/hit_suspicious.txt"
+HIT_PROC="$QDIR/high_ioc_process.txt"
+HIT_FILE="$QDIR/high_ioc_file.txt"
+HIT_PERSIST="$QDIR/high_ioc_persist.txt"
+HIT_SUSP="$QDIR/medium_suspicious.txt"
+HIT_LOW="$QDIR/low_cron_comment.txt"
+HIT_AUTHKEY="$QDIR/authorized_keys.txt"
+HIT_PORT="$QDIR/listening_ports.txt"
 
 detect_agent() {
   SERVICE=""
@@ -166,8 +195,8 @@ detect_agent() {
   if has systemctl; then
     for s in $(
       {
-        systemctl list-units --type=service --all --no-legend 2>/dev/null | awk '{print $1}' | grep -Ei 'nezha.*agent|nezha-agent' || true
-        systemctl list-unit-files --type=service --no-legend 2>/dev/null | awk '{print $1}' | grep -Ei 'nezha.*agent|nezha-agent' || true
+        systemctl list-units --type=service --all --no-legend 2>/dev/null | awk '{print $1}' | grep -Ei '(^|-)nezha.*agent|nezha-agent' || true
+        systemctl list-unit-files --type=service --no-legend 2>/dev/null | awk '{print $1}' | grep -Ei '(^|-)nezha.*agent|nezha-agent' || true
         echo nezha-agent.service
       } | sed '/^$/d' | sort -u
     ); do
@@ -244,7 +273,7 @@ restart_agent() {
       ok "Agent 已重启"
       return 0
     fi
-    warn "Agent 重启后不是 active，详情看日志：$LOG"
+    warn "Agent 重启后不是 active，详情看日志"
     systemctl status "$SERVICE" --no-pager -l >> "$LOG" 2>&1
     return 1
   fi
@@ -254,11 +283,21 @@ restart_agent() {
 }
 
 harden_config() {
-  title "加固 Agent 配置"
+  title "哪吒 Agent 风险配置修复"
 
   if [ -z "$CONFIG" ] || [ ! -f "$CONFIG" ]; then
-    warn "未找到 Agent 配置文件，跳过配置加固"
+    warn "未找到 Agent 配置文件，跳过配置修复"
     return 1
+  fi
+
+  local old_dce old_nat old_auto old_force
+  old_dce="$(yaml_get "$CONFIG" disable_command_execute)"
+  old_nat="$(yaml_get "$CONFIG" disable_nat)"
+  old_auto="$(yaml_get "$CONFIG" disable_auto_update)"
+  old_force="$(yaml_get "$CONFIG" disable_force_update)"
+
+  if [ "$old_dce" != "true" ] || [ "$old_nat" != "true" ] || [ "$old_auto" = "true" ] || [ "$old_force" = "true" ]; then
+    CONFIG_RISK=1
   fi
 
   cp -a "$CONFIG" "$CONFIG.bak.${TS}" 2>/dev/null
@@ -273,13 +312,15 @@ harden_config() {
     yaml_set_bool "$CONFIG" disable_send_query true
   fi
 
-  ok "已关闭远程命令/终端/文件管理能力"
-  ok "已关闭 NAT 任务"
-  ok "已保留 Agent 自动更新和面板强制更新"
+  ok "远程命令/在线终端/文件管理：已关闭"
+  ok "NAT 任务：已关闭"
+  ok "Agent 自动更新：已开启"
+  ok "面板强制更新：已开启"
   info "配置备份：$CONFIG.bak.${TS}"
 
   {
-    echo "--- key config ---"
+    echo
+    echo "--- Nezha Agent key config ---"
     grep -E '^(debug|disable_command_execute|disable_nat|disable_send_query|disable_auto_update|disable_force_update):' "$CONFIG" 2>/dev/null || true
   } >> "$LOG"
 }
@@ -297,7 +338,7 @@ arch_list() {
 }
 
 update_agent_once() {
-  title "自动升级 Agent 一次"
+  title "Agent 原地升级一次"
 
   if [ "${NO_UPDATE:-0}" = "1" ]; then
     warn "NO_UPDATE=1，跳过升级"
@@ -328,11 +369,11 @@ update_agent_once() {
   BEFORE_VER="$(agent_version "$AGENT_BIN" | head -n1)"
   [ -n "$BEFORE_VER" ] && info "升级前：$BEFORE_VER"
 
-  local tmpd
+  local tmpd zip ok_arch newbin
   tmpd="$(mktemp -d)"
-  local zip="$tmpd/agent.zip"
-  local ok_arch=""
-  local newbin=""
+  zip="$tmpd/agent.zip"
+  ok_arch=""
+  newbin=""
 
   for arch in $(arch_list); do
     [ "$arch" = "unknown" ] && continue
@@ -355,7 +396,7 @@ update_agent_once() {
   if [ -z "$ok_arch" ] || [ -z "$newbin" ]; then
     rm -rf "$tmpd"
     bad "下载最新版 Agent 失败"
-    warn "如果 GitHub 慢，可用：GH_PROXY='https://ghfast.top/' bash install.sh"
+    warn "GitHub 慢可用：GH_PROXY='https://ghfast.top/' bash install.sh"
     UPDATE_FAIL=1
     return 1
   fi
@@ -392,21 +433,64 @@ update_agent_once() {
   return 0
 }
 
-scan_ioc() {
-  title "扫描病毒/挖矿 IOC"
-
+scan_high_ioc_process() {
   : > "$HIT_PROC"
-  : > "$HIT_FILE"
-  : > "$HIT_PERSIST"
-  : > "$HIT_SUSP"
 
-  ps auxww | grep -Ei "$IOC_REGEX" | grep -v grep > "$HIT_PROC" 2>/dev/null
+  ps auxww | awk '
+    BEGIN { IGNORECASE=1 }
+    {
+      line=$0
+
+      # 排除正常内核线程格式：[kworker/...], [kdevtmpfs]
+      if (line ~ /\[kworker\//) next
+      if (line ~ /\[kdevtmpfs\]/) next
+
+      if (
+        line ~ /\/shm\/\.kworker/ ||
+        line ~ /\/dev\/shm\/\.kworker/ ||
+        line ~ /\/run\/shm\/\.kworker/ ||
+        line ~ /\/tmp\/\.kworker/ ||
+        line ~ /\/var\/tmp\/\.kworker/ ||
+        line ~ /\/tmp\/kdevtmpfsi/ ||
+        line ~ /\/var\/tmp\/kdevtmpfsi/ ||
+        line ~ /\/dev\/shm\/kdevtmpfsi/ ||
+        line ~ /\/run\/shm\/kdevtmpfsi/ ||
+        line ~ /\/tmp\/kinsing/ ||
+        line ~ /\/var\/tmp\/kinsing/ ||
+        line ~ /\/dev\/shm\/kinsing/ ||
+        line ~ /\/run\/shm\/kinsing/ ||
+        line ~ /\/tmp\/xmrig/ ||
+        line ~ /\/var\/tmp\/xmrig/ ||
+        line ~ /\/dev\/shm\/xmrig/ ||
+        line ~ /\/run\/shm\/xmrig/ ||
+        line ~ /\/tmp\/\.xmrig/ ||
+        line ~ /\/var\/tmp\/\.xmrig/ ||
+        line ~ /\/dev\/shm\/\.xmrig/ ||
+        line ~ /\/run\/shm\/\.xmrig/ ||
+        line ~ /\/tmp\/kinsingwatch/ ||
+        line ~ /\/var\/tmp\/kinsingwatch/ ||
+        line ~ /(^|[[:space:]])kworker_u8([[:space:]]|$)/ ||
+        line ~ /(^|[[:space:]])kdevtmpfsi([[:space:]]|$)/ ||
+        line ~ /(^|[[:space:]])kinsing([[:space:]]|$)/ ||
+        line ~ /(^|[[:space:]])kinsingwatch([[:space:]]|$)/ ||
+        line ~ /(^|[[:space:]])xmrig([[:space:]]|$)/
+      ) print line
+    }
+  ' > "$HIT_PROC" 2>/dev/null
+
   if [ -s "$HIT_PROC" ]; then
-    FOUND_PROC=1
-    bad "发现已知挖矿进程"
+    FOUND_IOC_PROCESS=1
+    bad "发现高置信挖矿进程"
+    out ""
+    out "${B}命中进程：${C0}"
+    head -20 "$HIT_PROC" | tee -a "$LOG"
   else
-    ok "未发现已知挖矿进程"
+    ok "未发现高置信挖矿进程"
   fi
+}
+
+scan_high_ioc_files() {
+  : > "$HIT_FILE"
 
   for f in \
     /shm/.kworker* \
@@ -441,241 +525,83 @@ scan_ioc() {
   sort -u "$HIT_FILE" -o "$HIT_FILE"
 
   if [ -s "$HIT_FILE" ]; then
-    FOUND_FILE=1
-    bad "发现已知挖矿文件"
+    FOUND_IOC_FILE=1
+    bad "发现高置信挖矿文件"
+    out ""
+    out "${B}命中文件：${C0}"
+    head -30 "$HIT_FILE" | tee -a "$LOG"
   else
-    ok "未发现已知挖矿文件"
+    ok "未发现高置信挖矿文件"
   fi
+}
 
-  grep -REin "$IOC_REGEX" \
-    /etc/crontab \
-    /etc/cron.d \
-    /etc/cron.daily \
-    /etc/cron.hourly \
-    /etc/cron.weekly \
-    /etc/cron.monthly \
-    /var/spool/cron \
-    /var/spool/cron/crontabs \
-    /etc/systemd/system \
-    /lib/systemd/system \
-    /usr/lib/systemd/system \
-    /root/.bashrc \
-    /root/.profile \
-    /root/.bash_profile \
-    /etc/profile \
-    /etc/bash.bashrc \
-    /etc/profile.d \
-    2>/dev/null > "$HIT_PERSIST"
+scan_persistence() {
+  : > "$HIT_PERSIST"
+  : > "$HIT_SUSP"
+  : > "$HIT_LOW"
+
+  local targets
+  targets="
+/etc/crontab
+/etc/cron.d
+/etc/cron.daily
+/etc/cron.hourly
+/etc/cron.weekly
+/etc/cron.monthly
+/var/spool/cron
+/var/spool/cron/crontabs
+/etc/systemd/system
+/lib/systemd/system
+/usr/lib/systemd/system
+/root/.bashrc
+/root/.profile
+/root/.bash_profile
+/etc/profile
+/etc/bash.bashrc
+/etc/profile.d
+"
+
+  # 高置信持久化：必须含具体 IOC 名称/路径。
+  grep -REin "$IOC_LINE_REGEX" $targets 2>/dev/null | \
+    grep -Ev '^[^:]+:[0-9]+:[[:space:]]*#' > "$HIT_PERSIST"
+
+  # 中风险：下载执行、base64、临时目录可执行；注释行不算。
+  grep -REin "$SUSP_LINE_REGEX" $targets 2>/dev/null | \
+    grep -Ev '^[^:]+:[0-9]+:[[:space:]]*#' > "$HIT_SUSP"
+
+  # 低风险 crontab 注释：不算病毒，只清理误报。
+  grep -REin '^# \(/tmp/tmp\.[^)]* installed on ' /var/spool/cron /var/spool/cron/crontabs 2>/dev/null > "$HIT_LOW"
 
   if [ -s "$HIT_PERSIST" ]; then
-    FOUND_PERSIST=1
-    bad "发现已知挖矿自启动残留"
+    FOUND_IOC_PERSIST=1
+    bad "发现高置信挖矿自启动"
+    out ""
+    out "${B}命中自启动：${C0}"
+    head -30 "$HIT_PERSIST" | tee -a "$LOG"
   else
-    ok "未发现已知挖矿自启动残留"
+    ok "未发现高置信挖矿自启动"
   fi
-
-  grep -REin "$SUSP_REGEX" \
-    /etc/crontab \
-    /etc/cron.d \
-    /etc/cron.daily \
-    /etc/cron.hourly \
-    /etc/cron.weekly \
-    /etc/cron.monthly \
-    /var/spool/cron \
-    /var/spool/cron/crontabs \
-    /etc/systemd/system \
-    /lib/systemd/system \
-    /usr/lib/systemd/system \
-    /root/.bashrc \
-    /root/.profile \
-    /root/.bash_profile \
-    /etc/profile \
-    /etc/bash.bashrc \
-    /etc/profile.d \
-    2>/dev/null > "$HIT_SUSP"
 
   if [ -s "$HIT_SUSP" ]; then
     FOUND_SUSP=1
-    warn "发现可疑启动项，需要人工确认"
+    warn "发现中风险可疑启动项，只提示不自动删除"
+    out ""
+    out "${B}中风险可疑项：${C0}"
+    head -20 "$HIT_SUSP" | tee -a "$LOG"
   else
-    ok "未发现明显可疑启动项"
+    ok "未发现中风险可疑启动项"
   fi
 
-  {
-    echo
-    echo "--- hit process ---"
-    cat "$HIT_PROC" 2>/dev/null
-    echo
-    echo "--- hit file ---"
-    cat "$HIT_FILE" 2>/dev/null
-    echo
-    echo "--- hit persist ---"
-    cat "$HIT_PERSIST" 2>/dev/null
-    echo
-    echo "--- suspicious ---"
-    cat "$HIT_SUSP" 2>/dev/null
-  } >> "$LOG"
-
-  if [ "${SHOW_DETAIL:-0}" = "1" ]; then
-    [ -s "$HIT_PROC" ] && { out ""; out "${B}命中进程：${C0}"; cat "$HIT_PROC" | tee -a "$LOG"; }
-    [ -s "$HIT_FILE" ] && { out ""; out "${B}命中文件：${C0}"; cat "$HIT_FILE" | tee -a "$LOG"; }
-    [ -s "$HIT_PERSIST" ] && { out ""; out "${B}命中自启动：${C0}"; cat "$HIT_PERSIST" | tee -a "$LOG"; }
-    [ -s "$HIT_SUSP" ] && { out ""; out "${B}可疑项：${C0}"; cat "$HIT_SUSP" | head -80 | tee -a "$LOG"; }
-  else
-    info "详细命中已写入日志：$LOG"
+  if [ -s "$HIT_LOW" ]; then
+    FOUND_LOW_COMMENT=1
+    warn "发现 crontab 临时文件注释，低风险，稍后自动清理误报"
+    out ""
+    out "${B}低风险注释：${C0}"
+    head -10 "$HIT_LOW" | tee -a "$LOG"
   fi
 }
 
-kill_ioc_processes() {
-  local killed=0
-
-  for pat in \
-    '/shm/.kworker' \
-    '/dev/shm/.kworker' \
-    '/run/shm/.kworker' \
-    '/tmp/.kworker' \
-    '/var/tmp/.kworker' \
-    'kworker_u8' \
-    'kdevtmpfsi' \
-    'kinsing' \
-    'xmrig' \
-    '.xmrig' \
-    'kinsingwatch'; do
-
-    local pids
-    pids="$(pgrep -f "$pat" 2>/dev/null)"
-    if [ -n "$pids" ]; then
-      echo "kill $pat: $pids" >> "$LOG"
-      kill $pids >> "$LOG" 2>&1
-      sleep 1
-      kill -9 $pids >> "$LOG" 2>&1
-      killed=1
-    fi
-  done
-
-  [ "$killed" = "1" ] && ok "已终止已知挖矿进程" || ok "无需终止挖矿进程"
-}
-
-quarantine_rm() {
-  local f="$1"
-  [ -e "$f" ] || return 0
-
-  chattr -i "$f" >> "$LOG" 2>&1
-  cp -a "$f" "$QDIR/" >> "$LOG" 2>&1
-  rm -rf "$f" >> "$LOG" 2>&1
-  echo "$f" >> "$QDIR/removed_files.txt"
-}
-
-clean_ioc_files() {
-  local removed=0
-
-  if [ -s "$HIT_FILE" ]; then
-    while IFS= read -r f; do
-      [ -n "$f" ] || continue
-      if [ -e "$f" ]; then
-        quarantine_rm "$f"
-        removed=1
-      fi
-    done < "$HIT_FILE"
-  fi
-
-  rmdir /shm >> "$LOG" 2>&1
-
-  [ "$removed" = "1" ] && ok "已隔离删除已知挖矿文件" || ok "无需删除挖矿文件"
-}
-
-clean_file_ioc_lines() {
-  local file="$1"
-  [ -f "$file" ] || return 0
-
-  if grep -Eiq "$IOC_REGEX" "$file"; then
-    cp -a "$file" "$QDIR/$(echo "$file" | tr '/' '_').bak" 2>/dev/null
-    local tmpf
-    tmpf="$(mktemp)"
-    grep -Eiv "$IOC_REGEX" "$file" > "$tmpf"
-    cat "$tmpf" > "$file"
-    rm -f "$tmpf"
-    echo "$file" >> "$QDIR/cleaned_persist_files.txt"
-  fi
-}
-
-clean_persistence() {
-  local changed=0
-
-  clean_file_ioc_lines /etc/crontab
-
-  for f in \
-    /etc/cron.d/* \
-    /etc/cron.daily/* \
-    /etc/cron.hourly/* \
-    /etc/cron.weekly/* \
-    /etc/cron.monthly/* \
-    /var/spool/cron/* \
-    /var/spool/cron/crontabs/* \
-    /root/.bashrc \
-    /root/.profile \
-    /root/.bash_profile \
-    /etc/profile \
-    /etc/bash.bashrc \
-    /etc/profile.d/*; do
-    clean_file_ioc_lines "$f"
-  done
-
-  local tmpcron
-  tmpcron="$(mktemp)"
-  crontab -l 2>/dev/null > "$tmpcron"
-  if grep -Eiq "$IOC_REGEX" "$tmpcron"; then
-    cp "$tmpcron" "$QDIR/current_user_crontab.bak" 2>/dev/null
-    grep -Eiv "$IOC_REGEX" "$tmpcron" | crontab -
-    echo "current_user_crontab" >> "$QDIR/cleaned_persist_files.txt"
-  fi
-  rm -f "$tmpcron"
-
-  local found_units
-  found_units="$(grep -RIlE "$IOC_REGEX" /etc/systemd/system /lib/systemd/system /usr/lib/systemd/system 2>/dev/null)"
-  for f in $found_units; do
-    cp -a "$f" "$QDIR/$(echo "$f" | tr '/' '_').bak" 2>/dev/null
-    local svc
-    svc="$(basename "$f")"
-    systemctl disable --now "$svc" >> "$LOG" 2>&1
-    chattr -i "$f" >> "$LOG" 2>&1
-    mv "$f" "$f.disabled_by_nezha_clean_${TS}" >> "$LOG" 2>&1
-    echo "$f" >> "$QDIR/cleaned_persist_files.txt"
-  done
-
-  has systemctl && systemctl daemon-reload >> "$LOG" 2>&1
-
-  if [ -f /etc/ld.so.preload ]; then
-    if grep -Eq '/tmp/|/var/tmp/|/dev/shm|/run/shm' /etc/ld.so.preload; then
-      cp -a /etc/ld.so.preload "$QDIR/ld.so.preload.bak" 2>/dev/null
-      : > /etc/ld.so.preload
-      echo "/etc/ld.so.preload" >> "$QDIR/cleaned_persist_files.txt"
-    fi
-  fi
-
-  if [ -s "$QDIR/cleaned_persist_files.txt" ]; then
-    changed=1
-  fi
-
-  [ "$changed" = "1" ] && ok "已清理已知挖矿自启动残留" || ok "无需清理已知自启动残留"
-}
-
-clean_ioc() {
-  title "清理已知 IOC"
-
-  if [ "${NO_CLEAN:-0}" = "1" ]; then
-    warn "NO_CLEAN=1，跳过清理"
-    return 0
-  fi
-
-  kill_ioc_processes
-  clean_ioc_files
-  clean_persistence
-}
-
-security_checks() {
-  title "基础安全排查"
-
+scan_security_context() {
   {
     echo
     echo "--- last -ai ---"
@@ -714,22 +640,228 @@ security_checks() {
       docker images 2>/dev/null
     fi
   } >> "$LOG"
+}
 
-  ok "最近登录、SSH Key、监听端口、高占用进程已写入日志"
-  info "日志：$LOG"
+scan_all() {
+  title "哪吒事件专项 IOC 扫描"
 
-  if [ "${SHOW_DETAIL:-0}" = "1" ]; then
+  scan_high_ioc_process
+  scan_high_ioc_files
+  scan_persistence
+  scan_security_context
+
+  info "登录记录、SSH Key、端口、高占用进程已写入日志"
+}
+
+kill_ioc_processes() {
+  local killed=0
+
+  # 精准杀高置信名称，避免误杀正常 kworker/kdevtmpfs
+  for pat in \
+    '/shm/.kworker' \
+    '/dev/shm/.kworker' \
+    '/run/shm/.kworker' \
+    '/tmp/.kworker' \
+    '/var/tmp/.kworker' \
+    '/tmp/kdevtmpfsi' \
+    '/var/tmp/kdevtmpfsi' \
+    '/dev/shm/kdevtmpfsi' \
+    '/run/shm/kdevtmpfsi' \
+    '/tmp/kinsing' \
+    '/var/tmp/kinsing' \
+    '/dev/shm/kinsing' \
+    '/run/shm/kinsing' \
+    '/tmp/xmrig' \
+    '/var/tmp/xmrig' \
+    '/dev/shm/xmrig' \
+    '/run/shm/xmrig' \
+    '/tmp/.xmrig' \
+    '/var/tmp/.xmrig' \
+    '/dev/shm/.xmrig' \
+    '/run/shm/.xmrig' \
+    '/tmp/kinsingwatch' \
+    '/var/tmp/kinsingwatch' \
+    'kworker_u8' \
+    'kdevtmpfsi' \
+    'kinsing' \
+    'kinsingwatch' \
+    'xmrig'; do
+
+    local pids
+    pids="$(pgrep -f "$pat" 2>/dev/null)"
+
+    # 避免把内核线程误杀：pgrep -f 理论上不会杀 [kworker/...]
+    if [ -n "$pids" ]; then
+      echo "kill pattern=$pat pids=$pids" >> "$LOG"
+      kill $pids >> "$LOG" 2>&1
+      sleep 1
+      kill -9 $pids >> "$LOG" 2>&1
+      killed=1
+      CLEANED_IOC=1
+    fi
+  done
+
+  [ "$killed" = "1" ] && ok "已终止高置信挖矿进程" || ok "无需终止挖矿进程"
+}
+
+quarantine_rm() {
+  local f="$1"
+  [ -e "$f" ] || return 0
+
+  chattr -i "$f" >> "$LOG" 2>&1
+  cp -a "$f" "$QDIR/" >> "$LOG" 2>&1
+  rm -rf "$f" >> "$LOG" 2>&1
+  echo "$f" >> "$QDIR/removed_files.txt"
+  CLEANED_IOC=1
+}
+
+clean_ioc_files() {
+  local removed=0
+
+  if [ -s "$HIT_FILE" ]; then
+    while IFS= read -r f; do
+      [ -n "$f" ] || continue
+      if [ -e "$f" ]; then
+        quarantine_rm "$f"
+        removed=1
+      fi
+    done < "$HIT_FILE"
+  fi
+
+  rmdir /shm >> "$LOG" 2>&1
+
+  [ "$removed" = "1" ] && ok "已隔离删除高置信挖矿文件" || ok "无需删除挖矿文件"
+}
+
+clean_ioc_line_in_file() {
+  local file="$1"
+  [ -f "$file" ] || return 0
+
+  if grep -Eiq "$IOC_LINE_REGEX" "$file"; then
+    cp -a "$file" "$QDIR/$(echo "$file" | tr '/' '_').bak" 2>/dev/null
+    local tmpf
+    tmpf="$(mktemp)"
+    grep -Eiv "$IOC_LINE_REGEX" "$file" > "$tmpf"
+    cat "$tmpf" > "$file"
+    rm -f "$tmpf"
+    echo "$file" >> "$QDIR/cleaned_persist_files.txt"
+    CLEANED_IOC=1
+  fi
+}
+
+clean_persistence_high_ioc() {
+  local changed=0
+
+  clean_ioc_line_in_file /etc/crontab
+
+  for f in \
+    /etc/cron.d/* \
+    /etc/cron.daily/* \
+    /etc/cron.hourly/* \
+    /etc/cron.weekly/* \
+    /etc/cron.monthly/* \
+    /var/spool/cron/* \
+    /var/spool/cron/crontabs/* \
+    /root/.bashrc \
+    /root/.profile \
+    /root/.bash_profile \
+    /etc/profile \
+    /etc/bash.bashrc \
+    /etc/profile.d/*; do
+    clean_ioc_line_in_file "$f"
+  done
+
+  local tmpcron
+  tmpcron="$(mktemp)"
+  crontab -l 2>/dev/null > "$tmpcron"
+  if grep -Eiq "$IOC_LINE_REGEX" "$tmpcron"; then
+    cp "$tmpcron" "$QDIR/current_user_crontab.bak" 2>/dev/null
+    grep -Eiv "$IOC_LINE_REGEX" "$tmpcron" | crontab -
+    echo "current_user_crontab" >> "$QDIR/cleaned_persist_files.txt"
+    CLEANED_IOC=1
+  fi
+  rm -f "$tmpcron"
+
+  local found_units
+  found_units="$(grep -RIlE "$IOC_LINE_REGEX" /etc/systemd/system /lib/systemd/system /usr/lib/systemd/system 2>/dev/null)"
+  for f in $found_units; do
+    cp -a "$f" "$QDIR/$(echo "$f" | tr '/' '_').bak" 2>/dev/null
+    local svc
+    svc="$(basename "$f")"
+    systemctl disable --now "$svc" >> "$LOG" 2>&1
+    chattr -i "$f" >> "$LOG" 2>&1
+    mv "$f" "$f.disabled_by_nezha_event_clean_${TS}" >> "$LOG" 2>&1
+    echo "$f" >> "$QDIR/cleaned_persist_files.txt"
+    CLEANED_IOC=1
+  done
+
+  has systemctl && systemctl daemon-reload >> "$LOG" 2>&1
+
+  if [ -f /etc/ld.so.preload ]; then
+    if grep -Eq '/tmp/|/var/tmp/|/dev/shm|/run/shm' /etc/ld.so.preload; then
+      cp -a /etc/ld.so.preload "$QDIR/ld.so.preload.bak" 2>/dev/null
+      : > /etc/ld.so.preload
+      echo "/etc/ld.so.preload" >> "$QDIR/cleaned_persist_files.txt"
+      CLEANED_IOC=1
+    fi
+  fi
+
+  if [ -s "$QDIR/cleaned_persist_files.txt" ]; then
+    changed=1
+  fi
+
+  [ "$changed" = "1" ] && ok "已清理高置信挖矿自启动" || ok "无需清理高置信挖矿自启动"
+}
+
+clean_low_cron_comment() {
+  local changed=0
+  local tmp
+
+  tmp="$(mktemp)"
+  crontab -l 2>/dev/null > "$tmp"
+  if grep -Eq '^# \(/tmp/tmp\.[^)]* installed on ' "$tmp"; then
+    cp "$tmp" "$QDIR/current_user_crontab_before_comment_clean.bak" 2>/dev/null
+    grep -Ev '^# \(/tmp/tmp\.[^)]* installed on ' "$tmp" | crontab -
+    changed=1
+  fi
+  rm -f "$tmp"
+
+  for f in /var/spool/cron/crontabs/* /var/spool/cron/*; do
+    [ -f "$f" ] || continue
+    if grep -Eq '^# \(/tmp/tmp\.[^)]* installed on ' "$f"; then
+      cp -a "$f" "$QDIR/$(echo "$f" | tr '/' '_').low_comment.bak" 2>/dev/null
+      sed -i -E '/^# \(\/tmp\/tmp\.[^)]* installed on /d' "$f"
+      changed=1
+    fi
+  done
+
+  [ "$changed" = "1" ] && ok "已清理 crontab 临时文件注释误报" || ok "没有 crontab 临时文件注释需要清理"
+}
+
+clean_high_ioc() {
+  title "高置信 IOC 自动清理"
+
+  if [ "${NO_CLEAN:-0}" = "1" ]; then
+    warn "NO_CLEAN=1，跳过清理"
+    return 0
+  fi
+
+  kill_ioc_processes
+  clean_ioc_files
+  clean_persistence_high_ioc
+  clean_low_cron_comment
+}
+
+show_review_tips() {
+  if [ "$FOUND_SUSP" = "1" ]; then
     out ""
-    out "${B}监听端口：${C0}"
-    ss -lntup 2>/dev/null | tee -a "$LOG" || netstat -lntup 2>/dev/null | tee -a "$LOG" || true
-    out ""
-    out "${B}CPU Top：${C0}"
-    ps auxww --sort=-%cpu | head -12 | tee -a "$LOG"
+    warn "中风险项没有自动删除，因为可能是正常运维命令。请人工看上面列出的行。"
+    info "重点看是否是陌生下载执行、base64 解码执行、/tmp 下可执行文件。"
   fi
 }
 
 final_verdict() {
-  title "结果"
+  title "最终结果"
 
   detect_agent
 
@@ -750,23 +882,28 @@ final_verdict() {
     dau="$(yaml_get "$CONFIG" disable_auto_update)"
     dfu="$(yaml_get "$CONFIG" disable_force_update)"
 
-    out "远程命令：$([ "$dce" = "true" ] && echo "已关闭" || echo "未确认")"
+    out "远程命令/终端/文件：$([ "$dce" = "true" ] && echo "已关闭" || echo "未确认")"
     out "NAT任务：$([ "$dna" = "true" ] && echo "已关闭" || echo "未确认")"
     out "自动更新：$([ "$dau" = "false" ] && echo "已开启" || echo "未确认")"
     out "面板强更：$([ "$dfu" = "false" ] && echo "已开启" || echo "未确认")"
   fi
 
   out ""
-  if [ "$FOUND_PROC" = "1" ] || [ "$FOUND_FILE" = "1" ] || [ "$FOUND_PERSIST" = "1" ]; then
-    bad "病毒判断：发现已知挖矿 IOC，已尝试清理。建议继续观察，反复出现就重装系统。"
+
+  if [ "$FOUND_IOC_PROCESS" = "1" ] || [ "$FOUND_IOC_FILE" = "1" ] || [ "$FOUND_IOC_PERSIST" = "1" ]; then
+    bad "结论：CLEANED - 发现高置信挖矿 IOC，已自动清理。建议观察是否复发，复发就重装系统。"
   elif [ "$FOUND_SUSP" = "1" ]; then
-    warn "病毒判断：未发现已知挖矿 IOC，但存在可疑启动项，需要人工确认日志。"
+    warn "结论：REVIEW - 未发现高置信挖矿 IOC，但存在中风险可疑项，需要人工确认。"
+  elif [ "$CONFIG_RISK" = "1" ]; then
+    warn "结论：RISK - 未发现高置信挖矿 IOC，但 Agent 风险配置已被修复。"
+  elif [ "$FOUND_LOW_COMMENT" = "1" ]; then
+    ok "结论：CLEAN - 只发现 crontab 临时文件注释误报，不是挖矿病毒，已清理。"
   else
-    ok "病毒判断：未发现明显已知挖矿 IOC。"
+    ok "结论：CLEAN - 未发现高置信哪吒事件常见挖矿 IOC。"
   fi
 
   if [ "$UPDATE_OK" = "1" ]; then
-    ok "Agent 升级：已执行一次原地升级"
+    ok "Agent 升级：已原地升级一次"
   elif [ "${NO_UPDATE:-0}" = "1" ]; then
     warn "Agent 升级：已按 NO_UPDATE=1 跳过"
   elif [ "$UPDATE_FAIL" = "1" ]; then
@@ -783,7 +920,7 @@ final_verdict() {
 main() {
   need_root
 
-  out "${B}Nezha Agent 清理 / 排查 / 原地升级${C0}"
+  out "${B}Nezha 事件专项 Agent 排查 / 清理 / 升级${C0}"
   out "${DIM}日志：$LOG${C0}"
 
   title "识别 Agent"
@@ -798,7 +935,7 @@ main() {
     [ -n "$BEFORE_VER" ] && info "当前版本：$BEFORE_VER"
   fi
 
-  scan_ioc
+  scan_all
   harden_config
   restart_agent
   update_agent_once
@@ -807,10 +944,11 @@ main() {
   harden_config
   restart_agent
 
-  clean_ioc
-  security_checks
+  clean_high_ioc
 
-  scan_ioc
+  # 清理后再扫一次，给最终判断更准确。
+  scan_all
+  show_review_tips
   final_verdict
 }
 
