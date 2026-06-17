@@ -1,112 +1,114 @@
 #!/usr/bin/env bash
 # install.sh
-# Nezha incident focused Agent cleaner / updater / hardener
+# Nezha Agent Pure Probe + systemd isolation
 #
-# 目标：
-#   针对哪吒 Dashboard RCE / cron 下发命令事件后的 Agent 侧排查与清理。
+# 用途：
+#   把已安装的哪吒 Agent 改成“纯探针 + systemd 隔离”模式。
 #
-# 设计原则：
-#   1. 尽量少误报：
-#      - 不把正常内核线程 [kworker/*] 当病毒
-#      - 不把正常内核线程 [kdevtmpfs] 当病毒
-#      - 不把 Xray 多端口监听当病毒
-#      - 不把 crontab 注释 "# (/tmp/tmp.xxx installed on ...)" 当病毒
-#      - 不因为单独出现 /tmp 就判病毒
-#
-#   2. 只自动清理高置信 IOC：
-#      - /tmp、/var/tmp、/dev/shm、/run/shm、/shm 下的：
-#        xmrig / .xmrig / kinsing / kdevtmpfsi / .kworker / kworker_u8 / kinsingwatch
-#      - cron / systemd / shell profile 中包含上述高置信 IOC 的执行项
-#
-#   3. 中风险可疑项只显示，不自动删除：
-#      - curl|bash、wget|sh、base64 -d、chmod +x /tmp、nohup /tmp 等
-#      - 这些可能是正常运维脚本，所以只提示人工确认
-#
-#   4. 哪吒 Agent 必做加固：
-#      - disable_command_execute: true
-#      - disable_nat: true
-#      - disable_auto_update: false
-#      - disable_force_update: false
-#
-# 执行：
-#   bash <(curl -fsSL https://raw.githubusercontent.com/inimemail/nagen/main/install.sh)
+# 默认策略，直接回车即可：
+#   保留：CPU / 内存 / 硬盘 / 流量 / 连接信息 / 在线状态上报
+#   保留：Agent 自己自动更新
+#   关闭：HTTP/TCP/ICMP 主动探测任务
+#   关闭：远程命令
+#   关闭：在线终端
+#   关闭：文件管理
+#   关闭：远程配置/任务控制
+#   关闭：NAT 内网穿透
+#   关闭：面板强制更新
+#   开启：systemd 权限隔离，但兼容 Agent 自动更新
 #
 # 可选：
-#   NO_UPDATE=1    跳过 Agent 升级
-#   NO_CLEAN=1     跳过高置信 IOC 自动清理
-#   STRICT=1       额外设置 disable_send_query: true
-#   SHOW_DETAIL=1  显示更多细节
+#   DO_UPDATE=1       顺便原地升级一次 Agent
+#   NO_IOC=1          跳过 IOC 扫描清理
+#   NO_SANDBOX=1      跳过 systemd 隔离
+#   SHOW_DETAIL=1     显示更多细节
 #   GH_PROXY='https://ghfast.top/'  GitHub 下载慢时使用
 #
-# 输出判断：
-#   CLEAN       未发现高置信病毒 IOC
-#   CLEANED     发现高置信病毒 IOC，已自动清理
-#   REVIEW      未发现高置信 IOC，但有中风险可疑项，需要人工确认
-#   RISK        Agent 配置存在风险，已修复
-#   ERROR       升级或识别失败
+# 说明：
+#   - 不需要填写 UUID / server / client_secret，会保留原配置。
+#   - systemd 隔离默认不改 User=，仍以原服务用户运行，避免影响基础监控和 Agent 自动更新。
+#   - 隔离会限制系统写入、家目录、内核参数、提权等，但允许 Agent 目录写入，所以 disable_auto_update=false 时仍可自动更新。
+#   - 面板强制更新会被关闭：disable_force_update=true。后续更新靠 Agent 自己自动更新。
 
 set +e
 umask 077
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$PATH"
 
 TS="$(date +%F_%H%M%S)"
-LOG="/root/nezha_event_clean_${TS}.log"
-QDIR="/root/nezha_event_quarantine_${TS}"
+LOG="/root/nezha_pure_probe_${TS}.log"
+QDIR="/root/nezha_pure_probe_quarantine_${TS}"
 mkdir -p "$QDIR"
 
 if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
-  C0="\033[0m"
-  B="\033[1m"
-  DIM="\033[2m"
-  GREEN="\033[32m"
-  YELLOW="\033[33m"
-  RED="\033[31m"
-  BLUE="\033[34m"
+  C0="\033[0m"; B="\033[1m"; DIM="\033[2m"
+  GREEN="\033[32m"; YELLOW="\033[33m"; RED="\033[31m"; BLUE="\033[34m"
 else
-  C0=""
-  B=""
-  DIM=""
-  GREEN=""
-  YELLOW=""
-  RED=""
-  BLUE=""
+  C0=""; B=""; DIM=""; GREEN=""; YELLOW=""; RED=""; BLUE=""
 fi
 
-out()   { printf "%b\n" "$*" | tee -a "$LOG"; }
-log()   { printf "%b\n" "$*" >> "$LOG"; }
-title() { out ""; out "${B}${BLUE}▶ $*${C0}"; }
-ok()    { out "${GREEN}✓${C0} $*"; }
-warn()  { out "${YELLOW}!${C0} $*"; }
-bad()   { out "${RED}✗${C0} $*"; }
-info()  { out "${DIM}- $*${C0}"; }
-has()   { command -v "$1" >/dev/null 2>&1; }
+out(){ printf "%b\n" "$*" | tee -a "$LOG"; }
+log(){ printf "%b\n" "$*" >> "$LOG"; }
+title(){ out ""; out "${B}${BLUE}▶ $*${C0}"; }
+ok(){ out "${GREEN}✓${C0} $*"; }
+warn(){ out "${YELLOW}!${C0} $*"; }
+bad(){ out "${RED}✗${C0} $*"; }
+info(){ out "${DIM}- $*${C0}"; }
+has(){ command -v "$1" >/dev/null 2>&1; }
 
-need_root() {
+need_root(){
   if [ "$(id -u)" -ne 0 ]; then
     bad "请用 root 执行"
     exit 1
   fi
 }
 
-download() {
+ask_yn(){
+  local prompt="$1"
+  local default="$2"
+  local suffix ans
+
+  if [ "$default" = "Y" ]; then suffix="[Y/n]"; else suffix="[y/N]"; fi
+
+  if [ "${NONINTERACTIVE:-0}" = "1" ] || [ ! -r /dev/tty ]; then
+    info "$prompt $suffix -> 默认 $default"
+    [ "$default" = "Y" ]
+    return $?
+  fi
+
+  while true; do
+    printf "%b" "${B}?${C0} ${prompt} ${suffix} " | tee -a "$LOG" >/dev/null
+    IFS= read -r ans < /dev/tty
+    printf "%s\n" "$ans" >> "$LOG"
+
+    [ -z "$ans" ] && { [ "$default" = "Y" ]; return $?; }
+
+    case "$ans" in
+      y|Y|yes|YES|Yes|是|开|开启|保留|关闭) return 0 ;;
+      n|N|no|NO|No|否|不|不开|跳过) return 1 ;;
+      *) warn "请输入 y 或 n，直接回车使用默认值" ;;
+    esac
+  done
+}
+
+download(){
   local url="$1"
-  local out_file="$2"
+  local dst="$2"
   local final_url="${GH_PROXY:-}${url}"
 
   if has curl; then
-    curl -fL --connect-timeout 20 --retry 3 --retry-delay 2 "$final_url" -o "$out_file" >> "$LOG" 2>&1
+    curl -fL --connect-timeout 20 --retry 3 --retry-delay 2 "$final_url" -o "$dst" >> "$LOG" 2>&1
     return $?
   fi
 
   if has wget; then
-    wget --timeout=25 --tries=3 -O "$out_file" "$final_url" >> "$LOG" 2>&1
+    wget --timeout=25 --tries=3 -O "$dst" "$final_url" >> "$LOG" 2>&1
     return $?
   fi
 
   return 127
 }
 
-install_pkg() {
+install_pkg(){
   local pkg="$1"
   has "$pkg" && return 0
 
@@ -125,17 +127,15 @@ install_pkg() {
   has "$pkg"
 }
 
-yaml_get() {
+yaml_get(){
   local file="$1"
   local key="$2"
-
   [ -f "$file" ] || return 1
-
   grep -E "^[[:space:]]*${key}[[:space:]]*:" "$file" 2>/dev/null | head -n1 | \
     sed -E "s/^[[:space:]]*${key}[[:space:]]*:[[:space:]]*//; s/[[:space:]]+#.*$//; s/^['\"]//; s/['\"]$//"
 }
 
-yaml_set_bool() {
+yaml_set_bool(){
   local file="$1"
   local key="$2"
   local val="$3"
@@ -149,48 +149,41 @@ yaml_set_bool() {
   fi
 }
 
-# 高置信 IOC：只命中这些才判为病毒并自动清理。
-# 注意：
-#   - 不匹配正常 [kworker/0:1]
-#   - 不匹配正常 [kdevtmpfs]
-#   - .kworker 必须在 tmp/shm 路径下
-IOC_PROCESS_REGEX='(^|[[:space:]])(/shm/\.kworker[^[:space:]]*|/dev/shm/\.kworker[^[:space:]]*|/run/shm/\.kworker[^[:space:]]*|/tmp/\.kworker[^[:space:]]*|/var/tmp/\.kworker[^[:space:]]*|/tmp/kdevtmpfsi|/var/tmp/kdevtmpfsi|/dev/shm/kdevtmpfsi|/run/shm/kdevtmpfsi|/tmp/kinsing|/var/tmp/kinsing|/dev/shm/kinsing|/run/shm/kinsing|/tmp/xmrig|/var/tmp/xmrig|/dev/shm/xmrig|/run/shm/xmrig|/tmp/\.xmrig|/var/tmp/\.xmrig|/dev/shm/\.xmrig|/run/shm/\.xmrig|/tmp/kinsingwatch|/var/tmp/kinsingwatch)([[:space:]]|$)|(^|[[:space:]])(kworker_u8|kdevtmpfsi|kinsing|kinsingwatch|xmrig)([[:space:]]|$)'
-
-IOC_LINE_REGEX='(/shm/\.kworker|/dev/shm/\.kworker|/run/shm/\.kworker|/tmp/\.kworker|/var/tmp/\.kworker|/tmp/kdevtmpfsi|/var/tmp/kdevtmpfsi|/dev/shm/kdevtmpfsi|/run/shm/kdevtmpfsi|/tmp/kinsing|/var/tmp/kinsing|/dev/shm/kinsing|/run/shm/kinsing|/tmp/xmrig|/var/tmp/xmrig|/dev/shm/xmrig|/run/shm/xmrig|/tmp/\.xmrig|/var/tmp/\.xmrig|/dev/shm/\.xmrig|/run/shm/\.xmrig|kworker_u8|kdevtmpfsi|kinsingwatch|kinsing|xmrig)'
-
-# 中风险：只提示，不自动删。
-SUSP_LINE_REGEX='(curl[[:space:]].*\|[[:space:]]*(sh|bash)|wget[[:space:]].*\|[[:space:]]*(sh|bash)|base64[[:space:]]+-d|chmod[[:space:]]+\+x[[:space:]]+/(tmp|var/tmp|dev/shm|run/shm)|nohup[[:space:]]+/(tmp|var/tmp|dev/shm|run/shm)|/(tmp|var/tmp|dev/shm|run/shm)/[^[:space:]]+[[:space:]]*(&|$))'
-
 SERVICE=""
 UNIT=""
 AGENT_BIN=""
 CONFIG=""
-BEFORE_VER=""
-AFTER_VER=""
 
-FOUND_IOC_PROCESS=0
-FOUND_IOC_FILE=0
-FOUND_IOC_PERSIST=0
-FOUND_SUSP=0
-FOUND_LOW_COMMENT=0
-CONFIG_RISK=0
-CLEANED_IOC=0
+KEEP_REPORT=1
+KEEP_AUTO_UPDATE=1
+CLOSE_QUERY=1
+CLOSE_REMOTE_CMD=1
+CLOSE_TERMINAL=1
+CLOSE_FILE=1
+CLOSE_REMOTE_CONFIG=1
+CLOSE_NAT=1
+CLOSE_FORCE_UPDATE=1
+ENABLE_SANDBOX=1
+DO_IOC=1
+
 UPDATE_OK=0
 UPDATE_FAIL=0
+FOUND_HIGH_IOC=0
+CLEANED_IOC=0
+FOUND_REVIEW=0
+FOUND_LOW=0
 
 HIT_PROC="$QDIR/high_ioc_process.txt"
 HIT_FILE="$QDIR/high_ioc_file.txt"
 HIT_PERSIST="$QDIR/high_ioc_persist.txt"
-HIT_SUSP="$QDIR/medium_suspicious.txt"
+HIT_REVIEW="$QDIR/review_suspicious.txt"
 HIT_LOW="$QDIR/low_cron_comment.txt"
-HIT_AUTHKEY="$QDIR/authorized_keys.txt"
-HIT_PORT="$QDIR/listening_ports.txt"
 
-detect_agent() {
-  SERVICE=""
-  UNIT=""
-  AGENT_BIN=""
-  CONFIG=""
+IOC_LINE_REGEX='(/shm/\.kworker|/dev/shm/\.kworker|/run/shm/\.kworker|/tmp/\.kworker|/var/tmp/\.kworker|/tmp/kdevtmpfsi|/var/tmp/kdevtmpfsi|/dev/shm/kdevtmpfsi|/run/shm/kdevtmpfsi|/tmp/kinsing|/var/tmp/kinsing|/dev/shm/kinsing|/run/shm/kinsing|/tmp/xmrig|/var/tmp/xmrig|/dev/shm/xmrig|/run/shm/xmrig|/tmp/\.xmrig|/var/tmp/\.xmrig|/dev/shm/\.xmrig|/run/shm/\.xmrig|/tmp/kinsingwatch|/var/tmp/kinsingwatch|kworker_u8|kdevtmpfsi|kinsingwatch|kinsing|xmrig)'
+REVIEW_LINE_REGEX='(curl[[:space:]].*\|[[:space:]]*(sh|bash)|wget[[:space:]].*\|[[:space:]]*(sh|bash)|base64[[:space:]]+-d|chmod[[:space:]]+\+x[[:space:]]+/(tmp|var/tmp|dev/shm|run/shm)|nohup[[:space:]]+/(tmp|var/tmp|dev/shm|run/shm)|/(tmp|var/tmp|dev/shm|run/shm)/[^[:space:]]+[[:space:]]*(&|$))'
+
+detect_agent(){
+  SERVICE=""; UNIT=""; AGENT_BIN=""; CONFIG=""
 
   if has systemctl; then
     for s in $(
@@ -209,9 +202,7 @@ detect_agent() {
 
   if [ -n "$SERVICE" ]; then
     UNIT="$(systemctl show -p FragmentPath --value "$SERVICE" 2>/dev/null)"
-    local catout
-    local exec_line
-
+    local catout exec_line
     catout="$(systemctl cat "$SERVICE" 2>/dev/null)"
     exec_line="$(printf "%s\n" "$catout" | grep -E '^[[:space:]]*ExecStart=' | tail -n1 | sed -E 's/^[[:space:]]*ExecStart=//')"
 
@@ -233,10 +224,7 @@ detect_agent() {
       /opt/nezha/nezha-agent \
       /usr/local/bin/nezha-agent \
       /usr/bin/nezha-agent; do
-      if [ -x "$p" ]; then
-        AGENT_BIN="$p"
-        break
-      fi
+      if [ -x "$p" ]; then AGENT_BIN="$p"; break; fi
     done
   fi
 
@@ -250,21 +238,18 @@ detect_agent() {
       /etc/nezha/config.yaml \
       /usr/local/etc/nezha/config.yml \
       /usr/local/etc/nezha/config.yaml; do
-      if [ -f "$p" ]; then
-        CONFIG="$p"
-        break
-      fi
+      if [ -f "$p" ]; then CONFIG="$p"; break; fi
     done
   fi
 }
 
-agent_version() {
+agent_version(){
   local bin="$1"
   [ -x "$bin" ] || return 1
   "$bin" -v 2>/dev/null || "$bin" --version 2>/dev/null || true
 }
 
-restart_agent() {
+restart_agent(){
   if [ -n "$SERVICE" ] && has systemctl; then
     systemctl daemon-reload >> "$LOG" 2>&1
     systemctl restart "$SERVICE" >> "$LOG" 2>&1
@@ -282,50 +267,154 @@ restart_agent() {
   return 1
 }
 
-harden_config() {
-  title "哪吒 Agent 风险配置修复"
+ask_options(){
+  title "选择纯探针权限，回车使用默认值"
+
+  ask_yn "保留基础监控上报：CPU/内存/硬盘/流量/连接信息/在线状态？" "Y"; KEEP_REPORT=$?
+  [ "$KEEP_REPORT" = "0" ] && KEEP_REPORT=1 || KEEP_REPORT=0
+
+  ask_yn "保留 Agent 自己自动更新？" "Y"; KEEP_AUTO_UPDATE=$?
+  [ "$KEEP_AUTO_UPDATE" = "0" ] && KEEP_AUTO_UPDATE=1 || KEEP_AUTO_UPDATE=0
+
+  ask_yn "关闭 HTTP/TCP/ICMP 主动探测任务？" "Y"; CLOSE_QUERY=$?
+  [ "$CLOSE_QUERY" = "0" ] && CLOSE_QUERY=1 || CLOSE_QUERY=0
+
+  ask_yn "关闭远程命令执行？" "Y"; CLOSE_REMOTE_CMD=$?
+  [ "$CLOSE_REMOTE_CMD" = "0" ] && CLOSE_REMOTE_CMD=1 || CLOSE_REMOTE_CMD=0
+
+  ask_yn "关闭在线终端？" "Y"; CLOSE_TERMINAL=$?
+  [ "$CLOSE_TERMINAL" = "0" ] && CLOSE_TERMINAL=1 || CLOSE_TERMINAL=0
+
+  ask_yn "关闭文件管理？" "Y"; CLOSE_FILE=$?
+  [ "$CLOSE_FILE" = "0" ] && CLOSE_FILE=1 || CLOSE_FILE=0
+
+  ask_yn "关闭远程配置/面板任务控制？" "Y"; CLOSE_REMOTE_CONFIG=$?
+  [ "$CLOSE_REMOTE_CONFIG" = "0" ] && CLOSE_REMOTE_CONFIG=1 || CLOSE_REMOTE_CONFIG=0
+
+  ask_yn "关闭 NAT 内网穿透任务？" "Y"; CLOSE_NAT=$?
+  [ "$CLOSE_NAT" = "0" ] && CLOSE_NAT=1 || CLOSE_NAT=0
+
+  ask_yn "关闭面板强制更新，保留 Agent 自己自动更新？" "Y"; CLOSE_FORCE_UPDATE=$?
+  [ "$CLOSE_FORCE_UPDATE" = "0" ] && CLOSE_FORCE_UPDATE=1 || CLOSE_FORCE_UPDATE=0
+
+  if [ "${NO_SANDBOX:-0}" = "1" ]; then
+    ENABLE_SANDBOX=0
+    warn "NO_SANDBOX=1：跳过 systemd 隔离"
+  else
+    ask_yn "开启 systemd 权限隔离？默认兼容 Agent 自动更新" "Y"; ENABLE_SANDBOX=$?
+    [ "$ENABLE_SANDBOX" = "0" ] && ENABLE_SANDBOX=1 || ENABLE_SANDBOX=0
+  fi
+
+  if [ "${DO_UPDATE:-0}" = "1" ]; then
+    info "DO_UPDATE=1：会执行一次 Agent 原地升级"
+  else
+    ask_yn "是否现在执行一次 Agent 原地升级？" "N"; local r=$?
+    [ "$r" = "0" ] && DO_UPDATE=1 || DO_UPDATE=0
+  fi
+
+  if [ "${NO_IOC:-0}" = "1" ]; then
+    DO_IOC=0
+    warn "NO_IOC=1：跳过 IOC 扫描清理"
+  else
+    ask_yn "扫描并自动清理哪吒事件常见高置信 IOC？" "Y"; DO_IOC=$?
+    [ "$DO_IOC" = "0" ] && DO_IOC=1 || DO_IOC=0
+  fi
+}
+
+apply_config(){
+  title "写入 Agent 纯探针配置"
 
   if [ -z "$CONFIG" ] || [ ! -f "$CONFIG" ]; then
-    warn "未找到 Agent 配置文件，跳过配置修复"
+    bad "未找到 Agent 配置文件，无法写入配置"
     return 1
   fi
 
-  local old_dce old_nat old_auto old_force
-  old_dce="$(yaml_get "$CONFIG" disable_command_execute)"
-  old_nat="$(yaml_get "$CONFIG" disable_nat)"
-  old_auto="$(yaml_get "$CONFIG" disable_auto_update)"
-  old_force="$(yaml_get "$CONFIG" disable_force_update)"
+  cp -a "$CONFIG" "$CONFIG.bak.pure_probe_${TS}" 2>/dev/null
 
-  if [ "$old_dce" != "true" ] || [ "$old_nat" != "true" ] || [ "$old_auto" = "true" ] || [ "$old_force" = "true" ]; then
-    CONFIG_RISK=1
+  if [ "$KEEP_REPORT" = "0" ]; then
+    warn "你选择不保留基础上报，这等于停止 Agent。"
+    if ask_yn "确认停止并禁用 nezha-agent？" "N"; then
+      systemctl disable --now "$SERVICE" >> "$LOG" 2>&1
+      ok "Agent 已停止并禁用"
+      exit 0
+    else
+      KEEP_REPORT=1
+      warn "已取消停止 Agent，继续保留基础监控上报"
+    fi
   fi
 
-  cp -a "$CONFIG" "$CONFIG.bak.${TS}" 2>/dev/null
+  local disable_cmd="false"
+  if [ "$CLOSE_REMOTE_CMD" = "1" ] || [ "$CLOSE_TERMINAL" = "1" ] || [ "$CLOSE_FILE" = "1" ] || [ "$CLOSE_REMOTE_CONFIG" = "1" ]; then
+    disable_cmd="true"
+  fi
 
   yaml_set_bool "$CONFIG" debug false
-  yaml_set_bool "$CONFIG" disable_command_execute true
-  yaml_set_bool "$CONFIG" disable_nat true
-  yaml_set_bool "$CONFIG" disable_auto_update false
-  yaml_set_bool "$CONFIG" disable_force_update false
+  yaml_set_bool "$CONFIG" disable_command_execute "$disable_cmd"
 
-  if [ "${STRICT:-0}" = "1" ]; then
-    yaml_set_bool "$CONFIG" disable_send_query true
-  fi
+  [ "$CLOSE_NAT" = "1" ] && yaml_set_bool "$CONFIG" disable_nat true || yaml_set_bool "$CONFIG" disable_nat false
+  [ "$CLOSE_QUERY" = "1" ] && yaml_set_bool "$CONFIG" disable_send_query true || yaml_set_bool "$CONFIG" disable_send_query false
+  [ "$KEEP_AUTO_UPDATE" = "1" ] && yaml_set_bool "$CONFIG" disable_auto_update false || yaml_set_bool "$CONFIG" disable_auto_update true
+  [ "$CLOSE_FORCE_UPDATE" = "1" ] && yaml_set_bool "$CONFIG" disable_force_update true || yaml_set_bool "$CONFIG" disable_force_update false
 
-  ok "远程命令/在线终端/文件管理：已关闭"
-  ok "NAT 任务：已关闭"
-  ok "Agent 自动更新：已开启"
-  ok "面板强制更新：已开启"
-  info "配置备份：$CONFIG.bak.${TS}"
+  ok "配置已写入"
+  info "配置备份：$CONFIG.bak.pure_probe_${TS}"
 
   {
     echo
-    echo "--- Nezha Agent key config ---"
+    echo "--- pure probe config ---"
     grep -E '^(debug|disable_command_execute|disable_nat|disable_send_query|disable_auto_update|disable_force_update):' "$CONFIG" 2>/dev/null || true
   } >> "$LOG"
 }
 
-arch_list() {
+apply_systemd_sandbox(){
+  title "写入 systemd 权限隔离"
+
+  if [ "$ENABLE_SANDBOX" != "1" ]; then
+    warn "跳过 systemd 隔离"
+    return 0
+  fi
+
+  if [ -z "$SERVICE" ] || ! has systemctl; then
+    warn "未识别到 systemd 服务，无法写入隔离"
+    return 1
+  fi
+
+  local agent_dir cfg_dir dropin
+  agent_dir="$(dirname "$AGENT_BIN" 2>/dev/null)"
+  cfg_dir="$(dirname "$CONFIG" 2>/dev/null)"
+  [ -z "$agent_dir" ] && agent_dir="/opt/nezha/agent"
+  [ -z "$cfg_dir" ] && cfg_dir="$agent_dir"
+
+  dropin="/etc/systemd/system/${SERVICE}.d"
+  mkdir -p "$dropin"
+
+  cat > "$dropin/10-pure-probe-hardening.conf" <<EOF
+[Service]
+# Pure-probe hardening generated at ${TS}
+# 兼容 Agent 自动更新：仍允许 Agent 目录写入。
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=read-only
+ProtectHostname=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+SystemCallArchitectures=native
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+CapabilityBoundingSet=
+AmbientCapabilities=
+ReadWritePaths=${agent_dir} ${cfg_dir}
+EOF
+
+  systemctl daemon-reload >> "$LOG" 2>&1
+  ok "systemd 隔离已写入：$dropin/10-pure-probe-hardening.conf"
+  info "兼容自动更新：已允许写入 ${agent_dir}"
+}
+
+arch_list(){
   case "$(uname -m)" in
     x86_64|amd64) echo "amd64" ;;
     aarch64|arm64) echo "arm64 arm" ;;
@@ -337,16 +426,16 @@ arch_list() {
   esac
 }
 
-update_agent_once() {
-  title "Agent 原地升级一次"
+update_agent_once(){
+  title "Agent 原地升级"
 
-  if [ "${NO_UPDATE:-0}" = "1" ]; then
-    warn "NO_UPDATE=1，跳过升级"
+  if [ "${DO_UPDATE:-0}" != "1" ]; then
+    warn "跳过原地升级"
     return 0
   fi
 
   if [ -z "$AGENT_BIN" ] || [ ! -x "$AGENT_BIN" ]; then
-    bad "未找到 Agent 二进制，无法自动升级"
+    bad "未找到 Agent 二进制，无法升级"
     UPDATE_FAIL=1
     return 1
   fi
@@ -358,18 +447,13 @@ update_agent_once() {
     return 1
   fi
 
-  local os
+  local os before tmpd zip ok_arch newbin
   os="$(uname -s | tr 'A-Z' 'a-z')"
-  if [ "$os" != "linux" ]; then
-    bad "当前系统不是 Linux，跳过自动替换升级"
-    UPDATE_FAIL=1
-    return 1
-  fi
+  [ "$os" != "linux" ] && { bad "当前系统不是 Linux，跳过升级"; UPDATE_FAIL=1; return 1; }
 
-  BEFORE_VER="$(agent_version "$AGENT_BIN" | head -n1)"
-  [ -n "$BEFORE_VER" ] && info "升级前：$BEFORE_VER"
+  before="$(agent_version "$AGENT_BIN" | head -n1)"
+  [ -n "$before" ] && info "升级前：$before"
 
-  local tmpd zip ok_arch newbin
   tmpd="$(mktemp -d)"
   zip="$tmpd/agent.zip"
   ok_arch=""
@@ -377,19 +461,14 @@ update_agent_once() {
 
   for arch in $(arch_list); do
     [ "$arch" = "unknown" ] && continue
-
     local url="https://github.com/nezhahq/agent/releases/latest/download/nezha-agent_${os}_${arch}.zip"
     info "下载最新版：linux_${arch}"
 
     if download "$url" "$zip" && [ -s "$zip" ]; then
       mkdir -p "$tmpd/unzip_$arch"
       unzip -o "$zip" -d "$tmpd/unzip_$arch" >> "$LOG" 2>&1
-
       newbin="$(find "$tmpd/unzip_$arch" -type f -name 'nezha-agent' 2>/dev/null | head -n1)"
-      if [ -n "$newbin" ]; then
-        ok_arch="$arch"
-        break
-      fi
+      [ -n "$newbin" ] && { ok_arch="$arch"; break; }
     fi
   done
 
@@ -401,17 +480,13 @@ update_agent_once() {
     return 1
   fi
 
-  if [ -n "$SERVICE" ] && has systemctl; then
-    systemctl stop "$SERVICE" >> "$LOG" 2>&1
-  fi
-
+  [ -n "$SERVICE" ] && systemctl stop "$SERVICE" >> "$LOG" 2>&1
   pkill -f "$AGENT_BIN" >> "$LOG" 2>&1
   sleep 1
 
   cp -a "$AGENT_BIN" "$AGENT_BIN.bak.${TS}" 2>/dev/null
   install -m 755 "$newbin" "$AGENT_BIN" >> "$LOG" 2>&1
   local rc=$?
-
   rm -rf "$tmpd"
 
   if [ "$rc" -ne 0 ]; then
@@ -423,28 +498,24 @@ update_agent_once() {
 
   ok "已替换 Agent 二进制：$ok_arch"
   info "旧二进制备份：$AGENT_BIN.bak.${TS}"
+  UPDATE_OK=1
 
   restart_agent
 
-  AFTER_VER="$(agent_version "$AGENT_BIN" | head -n1)"
-  [ -n "$AFTER_VER" ] && info "升级后：$AFTER_VER"
-
-  UPDATE_OK=1
-  return 0
+  local after
+  after="$(agent_version "$AGENT_BIN" | head -n1)"
+  [ -n "$after" ] && info "升级后：$after"
 }
 
-scan_high_ioc_process() {
+scan_high_ioc_process(){
   : > "$HIT_PROC"
 
   ps auxww | awk '
     BEGIN { IGNORECASE=1 }
     {
       line=$0
-
-      # 排除正常内核线程格式：[kworker/...], [kdevtmpfs]
       if (line ~ /\[kworker\//) next
       if (line ~ /\[kdevtmpfs\]/) next
-
       if (
         line ~ /\/shm\/\.kworker/ ||
         line ~ /\/dev\/shm\/\.kworker/ ||
@@ -479,7 +550,7 @@ scan_high_ioc_process() {
   ' > "$HIT_PROC" 2>/dev/null
 
   if [ -s "$HIT_PROC" ]; then
-    FOUND_IOC_PROCESS=1
+    FOUND_HIGH_IOC=1
     bad "发现高置信挖矿进程"
     out ""
     out "${B}命中进程：${C0}"
@@ -489,7 +560,7 @@ scan_high_ioc_process() {
   fi
 }
 
-scan_high_ioc_files() {
+scan_high_ioc_files(){
   : > "$HIT_FILE"
 
   for f in \
@@ -525,7 +596,7 @@ scan_high_ioc_files() {
   sort -u "$HIT_FILE" -o "$HIT_FILE"
 
   if [ -s "$HIT_FILE" ]; then
-    FOUND_IOC_FILE=1
+    FOUND_HIGH_IOC=1
     bad "发现高置信挖矿文件"
     out ""
     out "${B}命中文件：${C0}"
@@ -535,9 +606,9 @@ scan_high_ioc_files() {
   fi
 }
 
-scan_persistence() {
+scan_persistence(){
   : > "$HIT_PERSIST"
-  : > "$HIT_SUSP"
+  : > "$HIT_REVIEW"
   : > "$HIT_LOW"
 
   local targets
@@ -561,19 +632,16 @@ scan_persistence() {
 /etc/profile.d
 "
 
-  # 高置信持久化：必须含具体 IOC 名称/路径。
   grep -REin "$IOC_LINE_REGEX" $targets 2>/dev/null | \
     grep -Ev '^[^:]+:[0-9]+:[[:space:]]*#' > "$HIT_PERSIST"
 
-  # 中风险：下载执行、base64、临时目录可执行；注释行不算。
-  grep -REin "$SUSP_LINE_REGEX" $targets 2>/dev/null | \
-    grep -Ev '^[^:]+:[0-9]+:[[:space:]]*#' > "$HIT_SUSP"
+  grep -REin "$REVIEW_LINE_REGEX" $targets 2>/dev/null | \
+    grep -Ev '^[^:]+:[0-9]+:[[:space:]]*#' > "$HIT_REVIEW"
 
-  # 低风险 crontab 注释：不算病毒，只清理误报。
   grep -REin '^# \(/tmp/tmp\.[^)]* installed on ' /var/spool/cron /var/spool/cron/crontabs 2>/dev/null > "$HIT_LOW"
 
   if [ -s "$HIT_PERSIST" ]; then
-    FOUND_IOC_PERSIST=1
+    FOUND_HIGH_IOC=1
     bad "发现高置信挖矿自启动"
     out ""
     out "${B}命中自启动：${C0}"
@@ -582,26 +650,26 @@ scan_persistence() {
     ok "未发现高置信挖矿自启动"
   fi
 
-  if [ -s "$HIT_SUSP" ]; then
-    FOUND_SUSP=1
+  if [ -s "$HIT_REVIEW" ]; then
+    FOUND_REVIEW=1
     warn "发现中风险可疑启动项，只提示不自动删除"
     out ""
     out "${B}中风险可疑项：${C0}"
-    head -20 "$HIT_SUSP" | tee -a "$LOG"
+    head -20 "$HIT_REVIEW" | tee -a "$LOG"
   else
     ok "未发现中风险可疑启动项"
   fi
 
   if [ -s "$HIT_LOW" ]; then
-    FOUND_LOW_COMMENT=1
-    warn "发现 crontab 临时文件注释，低风险，稍后自动清理误报"
+    FOUND_LOW=1
+    warn "发现 crontab 临时文件注释，低风险，稍后清理误报"
     out ""
     out "${B}低风险注释：${C0}"
     head -10 "$HIT_LOW" | tee -a "$LOG"
   fi
 }
 
-scan_security_context() {
+scan_context_to_log(){
   {
     echo
     echo "--- last -ai ---"
@@ -642,21 +710,18 @@ scan_security_context() {
   } >> "$LOG"
 }
 
-scan_all() {
-  title "哪吒事件专项 IOC 扫描"
-
+scan_ioc(){
+  title "哪吒事件高置信 IOC 扫描"
   scan_high_ioc_process
   scan_high_ioc_files
   scan_persistence
-  scan_security_context
-
+  scan_context_to_log
   info "登录记录、SSH Key、端口、高占用进程已写入日志"
 }
 
-kill_ioc_processes() {
+kill_ioc_processes(){
   local killed=0
 
-  # 精准杀高置信名称，避免误杀正常 kworker/kdevtmpfs
   for pat in \
     '/shm/.kworker' \
     '/dev/shm/.kworker' \
@@ -686,11 +751,8 @@ kill_ioc_processes() {
     'kinsing' \
     'kinsingwatch' \
     'xmrig'; do
-
     local pids
     pids="$(pgrep -f "$pat" 2>/dev/null)"
-
-    # 避免把内核线程误杀：pgrep -f 理论上不会杀 [kworker/...]
     if [ -n "$pids" ]; then
       echo "kill pattern=$pat pids=$pids" >> "$LOG"
       kill $pids >> "$LOG" 2>&1
@@ -704,10 +766,9 @@ kill_ioc_processes() {
   [ "$killed" = "1" ] && ok "已终止高置信挖矿进程" || ok "无需终止挖矿进程"
 }
 
-quarantine_rm() {
+quarantine_rm(){
   local f="$1"
   [ -e "$f" ] || return 0
-
   chattr -i "$f" >> "$LOG" 2>&1
   cp -a "$f" "$QDIR/" >> "$LOG" 2>&1
   rm -rf "$f" >> "$LOG" 2>&1
@@ -715,7 +776,7 @@ quarantine_rm() {
   CLEANED_IOC=1
 }
 
-clean_ioc_files() {
+clean_ioc_files(){
   local removed=0
 
   if [ -s "$HIT_FILE" ]; then
@@ -729,11 +790,10 @@ clean_ioc_files() {
   fi
 
   rmdir /shm >> "$LOG" 2>&1
-
   [ "$removed" = "1" ] && ok "已隔离删除高置信挖矿文件" || ok "无需删除挖矿文件"
 }
 
-clean_ioc_line_in_file() {
+clean_ioc_line_in_file(){
   local file="$1"
   [ -f "$file" ] || return 0
 
@@ -749,9 +809,7 @@ clean_ioc_line_in_file() {
   fi
 }
 
-clean_persistence_high_ioc() {
-  local changed=0
-
+clean_persistence_high_ioc(){
   clean_ioc_line_in_file /etc/crontab
 
   for f in \
@@ -790,33 +848,22 @@ clean_persistence_high_ioc() {
     svc="$(basename "$f")"
     systemctl disable --now "$svc" >> "$LOG" 2>&1
     chattr -i "$f" >> "$LOG" 2>&1
-    mv "$f" "$f.disabled_by_nezha_event_clean_${TS}" >> "$LOG" 2>&1
+    mv "$f" "$f.disabled_by_pure_probe_${TS}" >> "$LOG" 2>&1
     echo "$f" >> "$QDIR/cleaned_persist_files.txt"
     CLEANED_IOC=1
   done
 
   has systemctl && systemctl daemon-reload >> "$LOG" 2>&1
 
-  if [ -f /etc/ld.so.preload ]; then
-    if grep -Eq '/tmp/|/var/tmp/|/dev/shm|/run/shm' /etc/ld.so.preload; then
-      cp -a /etc/ld.so.preload "$QDIR/ld.so.preload.bak" 2>/dev/null
-      : > /etc/ld.so.preload
-      echo "/etc/ld.so.preload" >> "$QDIR/cleaned_persist_files.txt"
-      CLEANED_IOC=1
-    fi
-  fi
-
   if [ -s "$QDIR/cleaned_persist_files.txt" ]; then
-    changed=1
+    ok "已清理高置信挖矿自启动"
+  else
+    ok "无需清理高置信挖矿自启动"
   fi
-
-  [ "$changed" = "1" ] && ok "已清理高置信挖矿自启动" || ok "无需清理高置信挖矿自启动"
 }
 
-clean_low_cron_comment() {
-  local changed=0
-  local tmp
-
+clean_low_cron_comment(){
+  local changed=0 tmp
   tmp="$(mktemp)"
   crontab -l 2>/dev/null > "$tmp"
   if grep -Eq '^# \(/tmp/tmp\.[^)]* installed on ' "$tmp"; then
@@ -838,11 +885,11 @@ clean_low_cron_comment() {
   [ "$changed" = "1" ] && ok "已清理 crontab 临时文件注释误报" || ok "没有 crontab 临时文件注释需要清理"
 }
 
-clean_high_ioc() {
+clean_ioc(){
   title "高置信 IOC 自动清理"
 
-  if [ "${NO_CLEAN:-0}" = "1" ]; then
-    warn "NO_CLEAN=1，跳过清理"
+  if [ "$DO_IOC" != "1" ]; then
+    warn "跳过 IOC 清理"
     return 0
   fi
 
@@ -852,15 +899,7 @@ clean_high_ioc() {
   clean_low_cron_comment
 }
 
-show_review_tips() {
-  if [ "$FOUND_SUSP" = "1" ]; then
-    out ""
-    warn "中风险项没有自动删除，因为可能是正常运维命令。请人工看上面列出的行。"
-    info "重点看是否是陌生下载执行、base64 解码执行、/tmp 下可执行文件。"
-  fi
-}
-
-final_verdict() {
+print_summary(){
   title "最终结果"
 
   detect_agent
@@ -876,40 +915,45 @@ final_verdict() {
   fi
 
   if [ -f "$CONFIG" ]; then
-    local dce dna dau dfu
+    local dce nat query auto force
     dce="$(yaml_get "$CONFIG" disable_command_execute)"
-    dna="$(yaml_get "$CONFIG" disable_nat)"
-    dau="$(yaml_get "$CONFIG" disable_auto_update)"
-    dfu="$(yaml_get "$CONFIG" disable_force_update)"
+    nat="$(yaml_get "$CONFIG" disable_nat)"
+    query="$(yaml_get "$CONFIG" disable_send_query)"
+    auto="$(yaml_get "$CONFIG" disable_auto_update)"
+    force="$(yaml_get "$CONFIG" disable_force_update)"
 
-    out "远程命令/终端/文件：$([ "$dce" = "true" ] && echo "已关闭" || echo "未确认")"
-    out "NAT任务：$([ "$dna" = "true" ] && echo "已关闭" || echo "未确认")"
-    out "自动更新：$([ "$dau" = "false" ] && echo "已开启" || echo "未确认")"
-    out "面板强更：$([ "$dfu" = "false" ] && echo "已开启" || echo "未确认")"
+    out ""
+    out "基础监控上报：保留"
+    out "Agent 自动更新：$([ "$auto" = "false" ] && echo "开启" || echo "关闭")"
+    out "HTTP/TCP/ICMP 主动探测：$([ "$query" = "true" ] && echo "关闭" || echo "开启")"
+    out "远程命令/终端/文件/远程配置：$([ "$dce" = "true" ] && echo "关闭" || echo "开启")"
+    out "NAT 内网穿透：$([ "$nat" = "true" ] && echo "关闭" || echo "开启")"
+    out "面板强制更新：$([ "$force" = "true" ] && echo "关闭" || echo "开启")"
+  fi
+
+  if [ "$ENABLE_SANDBOX" = "1" ]; then
+    out "systemd 隔离：开启"
+  else
+    out "systemd 隔离：未开启"
   fi
 
   out ""
-
-  if [ "$FOUND_IOC_PROCESS" = "1" ] || [ "$FOUND_IOC_FILE" = "1" ] || [ "$FOUND_IOC_PERSIST" = "1" ]; then
-    bad "结论：CLEANED - 发现高置信挖矿 IOC，已自动清理。建议观察是否复发，复发就重装系统。"
-  elif [ "$FOUND_SUSP" = "1" ]; then
-    warn "结论：REVIEW - 未发现高置信挖矿 IOC，但存在中风险可疑项，需要人工确认。"
-  elif [ "$CONFIG_RISK" = "1" ]; then
-    warn "结论：RISK - 未发现高置信挖矿 IOC，但 Agent 风险配置已被修复。"
-  elif [ "$FOUND_LOW_COMMENT" = "1" ]; then
-    ok "结论：CLEAN - 只发现 crontab 临时文件注释误报，不是挖矿病毒，已清理。"
+  if [ "$FOUND_HIGH_IOC" = "1" ]; then
+    bad "IOC 结论：发现高置信 IOC，已尝试自动清理"
+  elif [ "$FOUND_REVIEW" = "1" ]; then
+    warn "IOC 结论：未发现高置信 IOC，但有中风险项需要人工确认"
+  elif [ "$FOUND_LOW" = "1" ]; then
+    ok "IOC 结论：只发现低风险 crontab 注释误报，已清理"
   else
-    ok "结论：CLEAN - 未发现高置信哪吒事件常见挖矿 IOC。"
+    ok "IOC 结论：未发现高置信哪吒事件常见 IOC"
   fi
 
   if [ "$UPDATE_OK" = "1" ]; then
-    ok "Agent 升级：已原地升级一次"
-  elif [ "${NO_UPDATE:-0}" = "1" ]; then
-    warn "Agent 升级：已按 NO_UPDATE=1 跳过"
+    ok "升级：已执行一次 Agent 原地升级"
   elif [ "$UPDATE_FAIL" = "1" ]; then
-    bad "Agent 升级：失败，详情看日志"
+    bad "升级：失败，详情看日志"
   else
-    warn "Agent 升级：未确认"
+    info "升级：本次未执行；后续靠 Agent 自动更新"
   fi
 
   out ""
@@ -917,39 +961,45 @@ final_verdict() {
   out "隔离目录：$QDIR"
 }
 
-main() {
+main(){
   need_root
 
-  out "${B}Nezha 事件专项 Agent 排查 / 清理 / 升级${C0}"
+  out "${B}Nezha Agent 纯探针 + systemd 隔离脚本${C0}"
   out "${DIM}日志：$LOG${C0}"
 
   title "识别 Agent"
   detect_agent
 
-  if [ -n "$SERVICE" ]; then ok "服务：$SERVICE"; else warn "未识别到 systemd 服务"; fi
-  if [ -n "$AGENT_BIN" ]; then ok "二进制：$AGENT_BIN"; else bad "未识别到 Agent 二进制"; fi
-  if [ -n "$CONFIG" ]; then ok "配置：$CONFIG"; else warn "未识别到配置文件"; fi
+  [ -n "$SERVICE" ] && ok "服务：$SERVICE" || warn "未识别到 systemd 服务"
+  [ -n "$AGENT_BIN" ] && ok "二进制：$AGENT_BIN" || bad "未识别到 Agent 二进制"
+  [ -n "$CONFIG" ] && ok "配置：$CONFIG" || warn "未识别到配置文件"
 
   if [ -n "$AGENT_BIN" ] && [ -x "$AGENT_BIN" ]; then
-    BEFORE_VER="$(agent_version "$AGENT_BIN" | head -n1)"
-    [ -n "$BEFORE_VER" ] && info "当前版本：$BEFORE_VER"
+    cur="$(agent_version "$AGENT_BIN" | head -n1)"
+    [ -n "$cur" ] && info "当前版本：$cur"
   fi
 
-  scan_all
-  harden_config
+  ask_options
+  apply_config
+  apply_systemd_sandbox
   restart_agent
+
   update_agent_once
 
   detect_agent
-  harden_config
+  apply_config
+  apply_systemd_sandbox
   restart_agent
 
-  clean_high_ioc
+  if [ "$DO_IOC" = "1" ]; then
+    scan_ioc
+    clean_ioc
+    scan_ioc
+  else
+    warn "未执行 IOC 扫描"
+  fi
 
-  # 清理后再扫一次，给最终判断更准确。
-  scan_all
-  show_review_tips
-  final_verdict
+  print_summary
 }
 
 main "$@"
