@@ -5,7 +5,7 @@
 # 默认策略：
 #   [01] 开启：保留基础监控上报
 #   [02] 开启：保留 Agent 自己自动更新
-#   [03] 开启：关闭 HTTP/TCP/ICMP 主动探测
+#   [03] 开启：保留 HTTP/TCP/ICMP 主动探测权限
 #   [04] 关闭：远程命令权限
 #   [05] 关闭：在线终端权限
 #   [06] 关闭：文件管理权限
@@ -16,10 +16,10 @@
 #   [11] 开启：执行一次 Agent 原地升级
 #   [12] 开启：扫描并自动清理高置信 IOC
 #
-# 纯探针最终推荐配置：
+# 默认最终配置：
 #   disable_command_execute: true
 #   disable_nat: true
-#   disable_send_query: true
+#   disable_send_query: false
 #   disable_auto_update: false
 #   disable_force_update: true
 #
@@ -194,7 +194,7 @@ CONFIG=""
 
 KEEP_REPORT=1
 KEEP_AUTO_UPDATE=1
-CLOSE_QUERY=1
+CLOSE_QUERY=0
 CLOSE_REMOTE_TASKS=1
 CLOSE_NAT=1
 CLOSE_FORCE_UPDATE=1
@@ -334,7 +334,7 @@ ask_options() {
 
   if ask_yn "01/12" "保留基础监控上报" "Y"; then KEEP_REPORT=1; else KEEP_REPORT=0; fi
   if ask_yn "02/12" "保留 Agent 自己自动更新" "Y"; then KEEP_AUTO_UPDATE=1; else KEEP_AUTO_UPDATE=0; fi
-  if ask_yn "03/12" "关闭 HTTP/TCP/ICMP 主动探测" "Y"; then CLOSE_QUERY=1; else CLOSE_QUERY=0; fi
+  if ask_yn "03/12" "HTTP/TCP/ICMP 主动探测权限" "Y"; then CLOSE_QUERY=0; else CLOSE_QUERY=1; fi
 
   if ask_yn "04/12" "远程命令权限" "N"; then allow_cmd=1; else allow_cmd=0; fi
   if ask_yn "05/12" "在线终端权限" "N"; then allow_terminal=1; else allow_terminal=0; fi
@@ -1007,7 +1007,7 @@ print_summary() {
     out ""
     out "基础监控上报：保留"
     out "Agent 自动更新：$([ "$auto" = "false" ] && echo "开启" || echo "关闭")"
-    out "HTTP/TCP/ICMP 主动探测：$([ "$query" = "true" ] && echo "关闭" || echo "开启")"
+    out "HTTP/TCP/ICMP 主动探测权限：$([ "$query" = "false" ] && echo "开启" || echo "关闭")"
     out "远程命令/终端/文件/远程配置：$([ "$dce" = "true" ] && echo "关闭" || echo "开启")"
     out "NAT 内网穿透：$([ "$nat" = "true" ] && echo "关闭" || echo "开启")"
     out "面板强制更新：$([ "$force" = "true" ] && echo "关闭" || echo "开启")"
@@ -1047,7 +1047,7 @@ print_summary() {
 main() {
   need_root
 
-  out "${B}Nezha Agent 纯探针加固 v6${C0}"
+  out "${B}Nezha Agent 纯探针加固 v7${C0}"
   out "${DIM}日志：$LOG${C0}"
 
   title "识别 Agent"
