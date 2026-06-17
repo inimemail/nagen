@@ -1047,7 +1047,7 @@ print_summary() {
 main() {
   need_root
 
-  out "${B}Nezha Agent 纯探针加固 v7${C0}"
+  out "${B}Nezha Agent 探针加固 ${C0}"
   out "${DIM}日志：$LOG${C0}"
 
   title "识别 Agent"
