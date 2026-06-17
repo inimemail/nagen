@@ -1,40 +1,28 @@
 #!/usr/bin/env bash
 # install.sh
-# Nezha Agent Pure Probe + systemd isolation
+# Nezha Agent Pure Probe + systemd sandbox
 #
-# 用途：
-#   把已安装的哪吒 Agent 改成“纯探针 + systemd 隔离”模式。
-#
-# 默认策略，直接回车即可：
-#   保留：CPU / 内存 / 硬盘 / 流量 / 连接信息 / 在线状态上报
-#   保留：Agent 自己自动更新
-#   关闭：HTTP/TCP/ICMP 主动探测任务
-#   关闭：远程命令
-#   关闭：在线终端
-#   关闭：文件管理
-#   关闭：远程配置/任务控制
-#   关闭：NAT 内网穿透
-#   关闭：面板强制更新
-#   开启：systemd 权限隔离，但兼容 Agent 自动更新
+# 目标：
+#   把哪吒 Agent 加固成“纯探针模式”：
+#   - 保留 CPU / 内存 / 硬盘 / 流量 / 连接信息 / 在线状态上报
+#   - 保留 Agent 自己自动更新
+#   - 关闭远程命令 / 在线终端 / 文件管理 / 远程配置任务
+#   - 关闭 NAT 内网穿透
+#   - 关闭 HTTP/TCP/ICMP 主动探测任务
+#   - 关闭面板强制更新
+#   - 开启 systemd 权限隔离，但兼容 Agent 自动更新
 #
 # 执行：
 #   bash <(curl -fsSL https://raw.githubusercontent.com/inimemail/nagen/main/install.sh)
 #
-# 非交互全部默认：
+# 非交互默认：
 #   NONINTERACTIVE=1 bash <(curl -fsSL https://raw.githubusercontent.com/inimemail/nagen/main/install.sh)
 #
 # 可选：
 #   DO_UPDATE=1       顺便原地升级一次 Agent
 #   NO_IOC=1          跳过 IOC 扫描清理
 #   NO_SANDBOX=1      跳过 systemd 隔离
-#   SHOW_DETAIL=1     显示更多细节
 #   GH_PROXY='https://ghfast.top/'  GitHub 下载慢时使用
-#
-# 说明：
-#   - 不需要填写 UUID / server / client_secret，会保留原配置。
-#   - systemd 隔离默认不改 User=，仍以原服务用户运行，避免影响基础监控和 Agent 自动更新。
-#   - 隔离会限制系统写入、家目录、内核参数、提权等，但允许 Agent 目录写入，所以 disable_auto_update=false 时仍可自动更新。
-#   - 面板强制更新会被关闭：disable_force_update=true。后续更新靠 Agent 自己自动更新。
 
 set +e
 umask 077
@@ -53,7 +41,6 @@ else
 fi
 
 out(){ printf "%b\n" "$*" | tee -a "$LOG"; }
-log(){ printf "%b\n" "$*" >> "$LOG"; }
 title(){ out ""; out "${B}${BLUE}▶ $*${C0}"; }
 ok(){ out "${GREEN}✓${C0} $*"; }
 warn(){ out "${YELLOW}!${C0} $*"; }
@@ -69,35 +56,47 @@ need_root(){
 }
 
 ask_yn(){
-  local prompt="$1"
-  local default="$2"
-  local suffix ans
+  # ask_yn "01/12" "emoji" "标题" "默认 Y/N"
+  local no="$1"
+  local icon="$2"
+  local title_text="$3"
+  local def="$4"
+  local ans def_word
 
-  if [ "$default" = "Y" ]; then suffix="[Y/n]"; else suffix="[y/N]"; fi
+  if [ "$def" = "Y" ]; then
+    def_word="默认开启"
+  else
+    def_word="默认关闭"
+  fi
 
-  if [ "${NONINTERACTIVE:-0}" = "1" ] || [ ! -r /dev/tty ]; then
-    info "$prompt $suffix -> 默认 $default"
-    [ "$default" = "Y" ]
+  if [ "${NONINTERACTIVE:-0}" = "1" ]; then
+    info "${icon} ${no} ${title_text} -> ${def_word}"
+    [ "$def" = "Y" ]
     return $?
   fi
 
   while true; do
-    # 必须直接输出到 /dev/tty，否则 bash <(curl ...) 场景下可能看不到提示。
-    printf "%b" "${B}?${C0} ${prompt} ${suffix} " > /dev/tty
-    printf "? %s %s " "$prompt" "$suffix" >> "$LOG"
-    IFS= read -r ans < /dev/tty
-    printf "%s\n" "$ans" >> "$LOG"
+    printf "%b" "${icon} ${B}${no}${C0} ${title_text}  ${DIM}${def_word}${C0}  ${BLUE}[y/n/回车]${C0}: "
+    read -r ans
 
-    [ -z "$ans" ] && { [ "$default" = "Y" ]; return $?; }
+    if [ -z "$ans" ]; then
+      [ "$def" = "Y" ]
+      return $?
+    fi
 
     case "$ans" in
-      y|Y|yes|YES|Yes|是|开|开启|保留|关闭) return 0 ;;
-      n|N|no|NO|No|否|不|不开|跳过) return 1 ;;
-      *) warn "请输入 y 或 n，直接回车使用默认值" ;;
+      y|Y|yes|YES|Yes|是|开启|开|保留)
+        return 0
+        ;;
+      n|N|no|NO|No|否|不|不开|跳过|关闭)
+        return 1
+        ;;
+      *)
+        out "${YELLOW}⚠️  输入无效，请输入 y 或 n，或者直接回车。${C0}"
+        ;;
     esac
   done
 }
-
 download(){
   local url="$1"
   local dst="$2"
@@ -165,21 +164,18 @@ CONFIG=""
 KEEP_REPORT=1
 KEEP_AUTO_UPDATE=1
 CLOSE_QUERY=1
-CLOSE_REMOTE_CMD=1
-CLOSE_TERMINAL=1
-CLOSE_FILE=1
-CLOSE_REMOTE_CONFIG=1
+CLOSE_REMOTE_TASKS=1
 CLOSE_NAT=1
 CLOSE_FORCE_UPDATE=1
 ENABLE_SANDBOX=1
 DO_IOC=1
+DO_UPDATE="${DO_UPDATE:-0}"
 
-UPDATE_OK=0
-UPDATE_FAIL=0
 FOUND_HIGH_IOC=0
-CLEANED_IOC=0
 FOUND_REVIEW=0
 FOUND_LOW=0
+UPDATE_OK=0
+UPDATE_FAIL=0
 
 HIT_PROC="$QDIR/high_ioc_process.txt"
 HIT_FILE="$QDIR/high_ioc_file.txt"
@@ -191,7 +187,10 @@ IOC_LINE_REGEX='(/shm/\.kworker|/dev/shm/\.kworker|/run/shm/\.kworker|/tmp/\.kwo
 REVIEW_LINE_REGEX='(curl[[:space:]].*\|[[:space:]]*(sh|bash)|wget[[:space:]].*\|[[:space:]]*(sh|bash)|base64[[:space:]]+-d|chmod[[:space:]]+\+x[[:space:]]+/(tmp|var/tmp|dev/shm|run/shm)|nohup[[:space:]]+/(tmp|var/tmp|dev/shm|run/shm)|/(tmp|var/tmp|dev/shm|run/shm)/[^[:space:]]+[[:space:]]*(&|$))'
 
 detect_agent(){
-  SERVICE=""; UNIT=""; AGENT_BIN=""; CONFIG=""
+  SERVICE=""
+  UNIT=""
+  AGENT_BIN=""
+  CONFIG=""
 
   if has systemctl; then
     for s in $(
@@ -232,7 +231,7 @@ detect_agent(){
       /opt/nezha/nezha-agent \
       /usr/local/bin/nezha-agent \
       /usr/bin/nezha-agent; do
-      if [ -x "$p" ]; then AGENT_BIN="$p"; break; fi
+      [ -x "$p" ] && AGENT_BIN="$p" && break
     done
   fi
 
@@ -246,7 +245,7 @@ detect_agent(){
       /etc/nezha/config.yaml \
       /usr/local/etc/nezha/config.yml \
       /usr/local/etc/nezha/config.yaml; do
-      if [ -f "$p" ]; then CONFIG="$p"; break; fi
+      [ -f "$p" ] && CONFIG="$p" && break
     done
   fi
 }
@@ -276,62 +275,52 @@ restart_agent(){
 }
 
 ask_options(){
-  title "选择纯探针权限，回车使用默认值"
-  info "下面每一项都需要确认；直接回车就是默认值。"
+  title "🧩 纯探针权限配置"
+  out "${DIM}一路回车 = 推荐安全配置。每次只输入 y / n / 回车。${C0}"
+  out ""
 
-  ask_yn "保留基础监控上报：CPU/内存/硬盘/流量/连接信息/在线状态？" "Y"; KEEP_REPORT=$?
-  [ "$KEEP_REPORT" = "0" ] && KEEP_REPORT=1 || KEEP_REPORT=0
+  if ask_yn "01/12" "🟢" "保留基础监控上报" "Y"; then KEEP_REPORT=1; else KEEP_REPORT=0; fi
+  if ask_yn "02/12" "🔄" "保留 Agent 自己自动更新" "Y"; then KEEP_AUTO_UPDATE=1; else KEEP_AUTO_UPDATE=0; fi
+  if ask_yn "03/12" "🛡️" "关闭 HTTP/TCP/ICMP 主动探测" "Y"; then CLOSE_QUERY=1; else CLOSE_QUERY=0; fi
 
-  ask_yn "保留 Agent 自己自动更新？" "Y"; KEEP_AUTO_UPDATE=$?
-  [ "$KEEP_AUTO_UPDATE" = "0" ] && KEEP_AUTO_UPDATE=1 || KEEP_AUTO_UPDATE=0
+  if ask_yn "04/12" "🚫" "关闭远程命令执行" "Y"; then a=1; else a=0; fi
+  if ask_yn "05/12" "🖥️" "关闭在线终端" "Y"; then b=1; else b=0; fi
+  if ask_yn "06/12" "📁" "关闭文件管理" "Y"; then c=1; else c=0; fi
+  if ask_yn "07/12" "⚙️" "关闭远程配置/任务控制" "Y"; then d=1; else d=0; fi
 
-  ask_yn "关闭 HTTP/TCP/ICMP 主动探测任务？" "Y"; CLOSE_QUERY=$?
-  [ "$CLOSE_QUERY" = "0" ] && CLOSE_QUERY=1 || CLOSE_QUERY=0
+  if [ "$a" = "1" ] || [ "$b" = "1" ] || [ "$c" = "1" ] || [ "$d" = "1" ]; then
+    CLOSE_REMOTE_TASKS=1
+  else
+    CLOSE_REMOTE_TASKS=0
+  fi
 
-  ask_yn "关闭远程命令执行？" "Y"; CLOSE_REMOTE_CMD=$?
-  [ "$CLOSE_REMOTE_CMD" = "0" ] && CLOSE_REMOTE_CMD=1 || CLOSE_REMOTE_CMD=0
-
-  ask_yn "关闭在线终端？" "Y"; CLOSE_TERMINAL=$?
-  [ "$CLOSE_TERMINAL" = "0" ] && CLOSE_TERMINAL=1 || CLOSE_TERMINAL=0
-
-  ask_yn "关闭文件管理？" "Y"; CLOSE_FILE=$?
-  [ "$CLOSE_FILE" = "0" ] && CLOSE_FILE=1 || CLOSE_FILE=0
-
-  ask_yn "关闭远程配置/面板任务控制？" "Y"; CLOSE_REMOTE_CONFIG=$?
-  [ "$CLOSE_REMOTE_CONFIG" = "0" ] && CLOSE_REMOTE_CONFIG=1 || CLOSE_REMOTE_CONFIG=0
-
-  ask_yn "关闭 NAT 内网穿透任务？" "Y"; CLOSE_NAT=$?
-  [ "$CLOSE_NAT" = "0" ] && CLOSE_NAT=1 || CLOSE_NAT=0
-
-  ask_yn "关闭面板强制更新，保留 Agent 自己自动更新？" "Y"; CLOSE_FORCE_UPDATE=$?
-  [ "$CLOSE_FORCE_UPDATE" = "0" ] && CLOSE_FORCE_UPDATE=1 || CLOSE_FORCE_UPDATE=0
+  if ask_yn "08/12" "🌉" "关闭 NAT 内网穿透" "Y"; then CLOSE_NAT=1; else CLOSE_NAT=0; fi
+  if ask_yn "09/12" "🔒" "关闭面板强制更新" "Y"; then CLOSE_FORCE_UPDATE=1; else CLOSE_FORCE_UPDATE=0; fi
 
   if [ "${NO_SANDBOX:-0}" = "1" ]; then
     ENABLE_SANDBOX=0
     warn "NO_SANDBOX=1：跳过 systemd 隔离"
   else
-    ask_yn "开启 systemd 权限隔离？默认兼容 Agent 自动更新" "Y"; ENABLE_SANDBOX=$?
-    [ "$ENABLE_SANDBOX" = "0" ] && ENABLE_SANDBOX=1 || ENABLE_SANDBOX=0
+    if ask_yn "10/12" "🏰" "开启 systemd 权限隔离" "Y"; then ENABLE_SANDBOX=1; else ENABLE_SANDBOX=0; fi
   fi
 
-  if [ "${DO_UPDATE:-0}" = "1" ]; then
+  if [ "$DO_UPDATE" = "1" ]; then
     info "DO_UPDATE=1：会执行一次 Agent 原地升级"
   else
-    ask_yn "是否现在执行一次 Agent 原地升级？" "N"; local r=$?
-    [ "$r" = "0" ] && DO_UPDATE=1 || DO_UPDATE=0
+    if ask_yn "11/12" "⬆️" "现在执行一次 Agent 原地升级" "N"; then DO_UPDATE=1; else DO_UPDATE=0; fi
   fi
 
   if [ "${NO_IOC:-0}" = "1" ]; then
     DO_IOC=0
     warn "NO_IOC=1：跳过 IOC 扫描清理"
   else
-    ask_yn "扫描并自动清理哪吒事件常见高置信 IOC？" "Y"; DO_IOC=$?
-    [ "$DO_IOC" = "0" ] && DO_IOC=1 || DO_IOC=0
+    if ask_yn "12/12" "🧹" "扫描并自动清理高置信 IOC" "Y"; then DO_IOC=1; else DO_IOC=0; fi
   fi
-}
 
+  out ""
+}
 apply_config(){
-  title "写入 Agent 纯探针配置"
+  title "📝 写入 Agent 纯探针配置"
 
   if [ -z "$CONFIG" ] || [ ! -f "$CONFIG" ]; then
     bad "未找到 Agent 配置文件，无法写入配置"
@@ -352,14 +341,8 @@ apply_config(){
     fi
   fi
 
-  local disable_cmd="false"
-  if [ "$CLOSE_REMOTE_CMD" = "1" ] || [ "$CLOSE_TERMINAL" = "1" ] || [ "$CLOSE_FILE" = "1" ] || [ "$CLOSE_REMOTE_CONFIG" = "1" ]; then
-    disable_cmd="true"
-  fi
-
   yaml_set_bool "$CONFIG" debug false
-  yaml_set_bool "$CONFIG" disable_command_execute "$disable_cmd"
-
+  [ "$CLOSE_REMOTE_TASKS" = "1" ] && yaml_set_bool "$CONFIG" disable_command_execute true || yaml_set_bool "$CONFIG" disable_command_execute false
   [ "$CLOSE_NAT" = "1" ] && yaml_set_bool "$CONFIG" disable_nat true || yaml_set_bool "$CONFIG" disable_nat false
   [ "$CLOSE_QUERY" = "1" ] && yaml_set_bool "$CONFIG" disable_send_query true || yaml_set_bool "$CONFIG" disable_send_query false
   [ "$KEEP_AUTO_UPDATE" = "1" ] && yaml_set_bool "$CONFIG" disable_auto_update false || yaml_set_bool "$CONFIG" disable_auto_update true
@@ -376,7 +359,7 @@ apply_config(){
 }
 
 apply_systemd_sandbox(){
-  title "写入 systemd 权限隔离"
+  title "🏰 写入 systemd 权限隔离"
 
   if [ "$ENABLE_SANDBOX" != "1" ]; then
     warn "跳过 systemd 隔离"
@@ -400,7 +383,8 @@ apply_systemd_sandbox(){
   cat > "$dropin/10-pure-probe-hardening.conf" <<EOF
 [Service]
 # Pure-probe hardening generated at ${TS}
-# 兼容 Agent 自动更新：仍允许 Agent 目录写入。
+# 保持原服务用户，不强制改 User，避免影响基础监控和自动更新。
+# 兼容 Agent 自动更新：允许 Agent 目录和配置目录写入。
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=full
@@ -420,7 +404,7 @@ EOF
 
   systemctl daemon-reload >> "$LOG" 2>&1
   ok "systemd 隔离已写入：$dropin/10-pure-probe-hardening.conf"
-  info "兼容自动更新：已允许写入 ${agent_dir}"
+  info "自动更新兼容：允许写入 ${agent_dir}"
 }
 
 arch_list(){
@@ -436,9 +420,9 @@ arch_list(){
 }
 
 update_agent_once(){
-  title "Agent 原地升级"
+  title "⬆️ Agent 原地升级"
 
-  if [ "${DO_UPDATE:-0}" != "1" ]; then
+  if [ "$DO_UPDATE" != "1" ]; then
     warn "跳过原地升级"
     return 0
   fi
@@ -508,7 +492,6 @@ update_agent_once(){
   ok "已替换 Agent 二进制：$ok_arch"
   info "旧二进制备份：$AGENT_BIN.bak.${TS}"
   UPDATE_OK=1
-
   restart_agent
 
   local after
@@ -683,7 +666,6 @@ scan_context_to_log(){
     echo
     echo "--- last -ai ---"
     last -ai 2>/dev/null | head -50 || true
-
     echo
     echo "--- authorized_keys ---"
     if [ -f /root/.ssh/authorized_keys ]; then
@@ -695,32 +677,20 @@ scan_context_to_log(){
       echo "$ak"
       nl -ba "$ak"
     done
-
     echo
     echo "--- listening ports ---"
     ss -lntup 2>/dev/null || netstat -lntup 2>/dev/null || true
-
     echo
     echo "--- top cpu ---"
     ps auxww --sort=-%cpu | head -20
-
     echo
     echo "--- top mem ---"
     ps auxww --sort=-%mem | head -20
-
-    if has docker; then
-      echo
-      echo "--- docker ps -a ---"
-      docker ps -a 2>/dev/null
-      echo
-      echo "--- docker images ---"
-      docker images 2>/dev/null
-    fi
   } >> "$LOG"
 }
 
 scan_ioc(){
-  title "哪吒事件高置信 IOC 扫描"
+  title "🧬 哪吒事件高置信 IOC 扫描"
   scan_high_ioc_process
   scan_high_ioc_files
   scan_persistence
@@ -768,7 +738,6 @@ kill_ioc_processes(){
       sleep 1
       kill -9 $pids >> "$LOG" 2>&1
       killed=1
-      CLEANED_IOC=1
     fi
   done
 
@@ -782,7 +751,6 @@ quarantine_rm(){
   cp -a "$f" "$QDIR/" >> "$LOG" 2>&1
   rm -rf "$f" >> "$LOG" 2>&1
   echo "$f" >> "$QDIR/removed_files.txt"
-  CLEANED_IOC=1
 }
 
 clean_ioc_files(){
@@ -814,7 +782,6 @@ clean_ioc_line_in_file(){
     cat "$tmpf" > "$file"
     rm -f "$tmpf"
     echo "$file" >> "$QDIR/cleaned_persist_files.txt"
-    CLEANED_IOC=1
   fi
 }
 
@@ -845,7 +812,6 @@ clean_persistence_high_ioc(){
     cp "$tmpcron" "$QDIR/current_user_crontab.bak" 2>/dev/null
     grep -Eiv "$IOC_LINE_REGEX" "$tmpcron" | crontab -
     echo "current_user_crontab" >> "$QDIR/cleaned_persist_files.txt"
-    CLEANED_IOC=1
   fi
   rm -f "$tmpcron"
 
@@ -859,7 +825,6 @@ clean_persistence_high_ioc(){
     chattr -i "$f" >> "$LOG" 2>&1
     mv "$f" "$f.disabled_by_pure_probe_${TS}" >> "$LOG" 2>&1
     echo "$f" >> "$QDIR/cleaned_persist_files.txt"
-    CLEANED_IOC=1
   done
 
   has systemctl && systemctl daemon-reload >> "$LOG" 2>&1
@@ -895,7 +860,7 @@ clean_low_cron_comment(){
 }
 
 clean_ioc(){
-  title "高置信 IOC 自动清理"
+  title "🧹 高置信 IOC 自动清理"
 
   if [ "$DO_IOC" != "1" ]; then
     warn "跳过 IOC 清理"
@@ -909,7 +874,7 @@ clean_ioc(){
 }
 
 print_summary(){
-  title "最终结果"
+  title "✅ 最终结果"
 
   detect_agent
 
@@ -940,11 +905,7 @@ print_summary(){
     out "面板强制更新：$([ "$force" = "true" ] && echo "关闭" || echo "开启")"
   fi
 
-  if [ "$ENABLE_SANDBOX" = "1" ]; then
-    out "systemd 隔离：开启"
-  else
-    out "systemd 隔离：未开启"
-  fi
+  [ "$ENABLE_SANDBOX" = "1" ] && out "systemd 隔离：开启" || out "systemd 隔离：未开启"
 
   out ""
   if [ "$FOUND_HIGH_IOC" = "1" ]; then
@@ -973,10 +934,10 @@ print_summary(){
 main(){
   need_root
 
-  out "${B}Nezha Agent 纯探针 + systemd 隔离脚本${C0}"
+  out "${B}Nezha Agent 纯探针加固${C0}"
   out "${DIM}日志：$LOG${C0}"
 
-  title "识别 Agent"
+  title "🔎 识别 Agent"
   detect_agent
 
   [ -n "$SERVICE" ] && ok "服务：$SERVICE" || warn "未识别到 systemd 服务"
@@ -992,7 +953,6 @@ main(){
   apply_config
   apply_systemd_sandbox
   restart_agent
-
   update_agent_once
 
   detect_agent
