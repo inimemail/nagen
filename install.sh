@@ -605,7 +605,7 @@ update_agent_once() {
 
   UPDATE_OK=1
   ok "已替换 Agent 二进制：$ok_arch"
-  info "旧二进制备份：$AGENT_BIN.bak.pure_probe（固定覆盖，不堆文件）"
+  info "旧二进制备份：$AGENT_BIN.bak.pure_probe"
 
   restart_agent
 
