@@ -451,7 +451,7 @@ apply_config() {
 
   CONFIG_OK=1
   ok "配置已写入"
-  info "配置备份：$CONFIG.bak.pure_probe（固定覆盖，不堆文件）"
+  info "配置备份：$CONFIG.bak.pure_probe"
 
   {
     echo
