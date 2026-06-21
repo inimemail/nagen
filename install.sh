@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # install.sh
-# Nezha Agent 纯探针加固 + systemd 权限隔离 + 哪吒事件 IOC 扫描清理
+# Nezha Agent 纯探针加固 + systemd 权限隔离 + 常见挖矿/对外攻击 IOC 扫描清理
 #
 # 默认策略：
 #   [01] 开启：保留基础监控上报
@@ -14,7 +14,7 @@
 #   [09] 关闭：面板强制更新权限
 #   [10] 开启：systemd 权限隔离
 #   [11] 开启：执行一次 Agent 原地升级
-#   [12] 开启：扫描并自动清理高置信 IOC
+#   [12] 开启：扫描并自动清理高置信挖矿/对外攻击 IOC
 #
 # 默认最终配置：
 #   disable_command_execute: true
@@ -41,6 +41,7 @@
 #   - Agent 自己自动更新保留：disable_auto_update=false。
 #   - 面板强制更新默认关闭：disable_force_update=true。
 #   - systemd 隔离默认允许 Agent 目录写入，所以不影响 Agent 自己自动更新。
+#   - 不再创建/写入日志文件，只在屏幕输出必要结果。
 #   - 高置信 IOC 才自动清理，尽量避免误报。
 
 set +e
@@ -48,7 +49,6 @@ umask 077
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$PATH"
 
 TS="$(date +%F_%H%M%S)"
-LOG="/root/nezha_pure_probe_${TS}.log"
 QDIR="/root/nezha_pure_probe_quarantine_${TS}"
 mkdir -p "$QDIR"
 
@@ -70,7 +70,7 @@ else
   BLUE=""
 fi
 
-out()   { printf "%b\n" "$*" | tee -a "$LOG"; }
+out()   { printf "%b\n" "$*"; }
 title() { out ""; out "${B}${BLUE}▶ $*${C0}"; }
 ok()    { out "${GREEN}✓${C0} $*"; }
 warn()  { out "${YELLOW}!${C0} $*"; }
@@ -133,12 +133,12 @@ download() {
   local final_url="${GH_PROXY:-}${url}"
 
   if has curl; then
-    curl -fL --connect-timeout 20 --retry 3 --retry-delay 2 "$final_url" -o "$dst" >> "$LOG" 2>&1
+    curl -fL --connect-timeout 20 --retry 3 --retry-delay 2 "$final_url" -o "$dst" >/dev/null 2>&1
     return $?
   fi
 
   if has wget; then
-    wget --timeout=25 --tries=3 -O "$dst" "$final_url" >> "$LOG" 2>&1
+    wget --timeout=25 --tries=3 -O "$dst" "$final_url" >/dev/null 2>&1
     return $?
   fi
 
@@ -151,14 +151,14 @@ install_pkg() {
 
   warn "缺少 $pkg，尝试自动安装"
   if has apt-get; then
-    DEBIAN_FRONTEND=noninteractive apt-get update -y >> "$LOG" 2>&1
-    DEBIAN_FRONTEND=noninteractive apt-get install -y "$pkg" curl wget ca-certificates >> "$LOG" 2>&1
+    DEBIAN_FRONTEND=noninteractive apt-get update -y >/dev/null 2>&1
+    DEBIAN_FRONTEND=noninteractive apt-get install -y "$pkg" curl wget ca-certificates >/dev/null 2>&1
   elif has yum; then
-    yum install -y "$pkg" curl wget ca-certificates >> "$LOG" 2>&1
+    yum install -y "$pkg" curl wget ca-certificates >/dev/null 2>&1
   elif has dnf; then
-    dnf install -y "$pkg" curl wget ca-certificates >> "$LOG" 2>&1
+    dnf install -y "$pkg" curl wget ca-certificates >/dev/null 2>&1
   elif has apk; then
-    apk add --no-cache "$pkg" curl wget ca-certificates >> "$LOG" 2>&1
+    apk add --no-cache "$pkg" curl wget ca-certificates >/dev/null 2>&1
   fi
 
   has "$pkg"
@@ -222,12 +222,19 @@ HIT_FILE="$QDIR/high_ioc_file.txt"
 HIT_PERSIST="$QDIR/high_ioc_persist.txt"
 HIT_REVIEW="$QDIR/review_suspicious.txt"
 HIT_LOW="$QDIR/low_cron_comment.txt"
+HIT_NET="$QDIR/high_ioc_network.txt"
+HIT_PIDS="$QDIR/high_ioc_pids.txt"
 
-# 高置信 IOC：只命中这些才自动清理
-IOC_LINE_REGEX='(/shm/\.kworker|/dev/shm/\.kworker|/run/shm/\.kworker|/tmp/\.kworker|/var/tmp/\.kworker|/tmp/kdevtmpfsi|/var/tmp/kdevtmpfsi|/dev/shm/kdevtmpfsi|/run/shm/kdevtmpfsi|/tmp/kinsing|/var/tmp/kinsing|/dev/shm/kinsing|/run/shm/kinsing|/tmp/xmrig|/var/tmp/xmrig|/dev/shm/xmrig|/run/shm/xmrig|/tmp/\.xmrig|/var/tmp/\.xmrig|/dev/shm/\.xmrig|/run/shm/\.xmrig|/tmp/kinsingwatch|/var/tmp/kinsingwatch|kworker_u8|kdevtmpfsi|kinsingwatch|kinsing|xmrig)'
+# 高置信 IOC：只命中这些才自动清理。
+# 范围：常见挖矿、Kinsing/kdevtmpfsi/XMRig、Sysrv、perfctl、Mirai/Gafgyt/Mozi/Muhstik、常见扫描器/爆破工具等。
+IOC_LINE_REGEX='(/shm/\.kworker|/dev/shm/\.kworker|/run/shm/\.kworker|/tmp/\.kworker|/var/tmp/\.kworker|/(tmp|var/tmp|dev/shm|run/shm)/[^[:space:]]*(kdevtmpfsi|kinsing|kinsingwatch|xmrig|\.xmrig|xmr-stak|sysrv|sysrv-hello|perfctl|pnscan|masscan|zmap|zgrab|mirai|gafgyt|mozi|muhstik|tsunami|bashirc|dota3|dbused|\.javae|\.syst3md|\.systemd|\.httpd|\.sshd|\.watchdog|watchdogs)|(^|[[:space:]])(kworker_u8|kdevtmpfsi|kinsing|kinsingwatch|xmrig|xmrig-notls|xmr-stak|sysrv|sysrv-hello|perfctl|pnscan|masscan|zmap|zgrab|mirai|gafgyt|mozi|muhstik|tsunami|bashirc|dota3|dbused)([[:space:]]|$)|stratum\+tcp|pool\.[^[:space:]]*xmr|monero|cryptonight|nicehash)'
+
+HIGH_PROC_NAME_REGEX='(kworker_u8|kdevtmpfsi|kinsing|kinsingwatch|xmrig|xmrig-notls|xmr-stak|sysrv|sysrv-hello|perfctl|pnscan|masscan|zmap|zgrab|mirai|gafgyt|mozi|muhstik|tsunami|bashirc|dota3|dbused)'
+HIGH_TMP_NAME_REGEX='(\.kworker.*|kdevtmpfsi|kinsing|kinsingwatch|xmrig|\.xmrig|xmr-stak|sysrv.*|perfctl|pnscan|masscan|zmap|zgrab|mirai|gafgyt|mozi|muhstik|tsunami|bashirc|dota3|dbused|\.javae|\.syst3md|\.systemd|\.httpd|\.sshd|\.watchdogs?|watchdogs?)'
+MINER_PORT_REGEX=':(3333|3334|3335|4444|5555|5556|6666|7777|7778|8888|9999|14433|14444|45700|55555)([[:space:]]|$)'
 
 # 中风险：只提示，不自动删
-REVIEW_LINE_REGEX='(curl[[:space:]].*\|[[:space:]]*(sh|bash)|wget[[:space:]].*\|[[:space:]]*(sh|bash)|base64[[:space:]]+-d|chmod[[:space:]]+\+x[[:space:]]+/(tmp|var/tmp|dev/shm|run/shm)|nohup[[:space:]]+/(tmp|var/tmp|dev/shm|run/shm)|/(tmp|var/tmp|dev/shm|run/shm)/[^[:space:]]+[[:space:]]*(&|$))'
+REVIEW_LINE_REGEX='(curl[[:space:]].*\|[[:space:]]*(sh|bash)|wget[[:space:]].*\|[[:space:]]*(sh|bash)|base64[[:space:]]+-d|chmod[[:space:]]+\+x[[:space:]]+/(tmp|var/tmp|dev/shm|run/shm)|nohup[[:space:]]+/(tmp|var/tmp|dev/shm|run/shm)|/(tmp|var/tmp|dev/shm|run/shm)/[^[:space:]]+[[:space:]]*(&|$)|bash[[:space:]]+-c[[:space:]].*/(tmp|var/tmp|dev/shm|run/shm)|python[0-9.]*[[:space:]].*(socket|subprocess|base64)|perl[[:space:]].*(socket|IO::Socket)|nc[[:space:]]+.*-e|ncat[[:space:]]+.*-e|socat[[:space:]].*EXEC:)'
 
 detect_agent() {
   SERVICE=""
@@ -308,8 +315,8 @@ agent_version() {
 
 restart_agent() {
   if [ -n "$SERVICE" ] && has systemctl; then
-    systemctl daemon-reload >> "$LOG" 2>&1
-    systemctl restart "$SERVICE" >> "$LOG" 2>&1
+    systemctl daemon-reload >/dev/null 2>&1
+    systemctl restart "$SERVICE" >/dev/null 2>&1
     sleep 1
 
     if systemctl is-active --quiet "$SERVICE"; then
@@ -317,8 +324,8 @@ restart_agent() {
       return 0
     fi
 
-    warn "Agent 重启后不是 active，详情看日志"
-    systemctl status "$SERVICE" --no-pager -l >> "$LOG" 2>&1
+    warn "Agent 重启后不是 active，请手动执行 systemctl status 查看"
+    systemctl status "$SERVICE" --no-pager -l >/dev/null 2>&1
     return 1
   fi
 
@@ -368,7 +375,7 @@ ask_options() {
     DO_IOC=0
     warn "NO_IOC=1：跳过 IOC 扫描清理"
   else
-    if ask_yn "12/12" "扫描并自动清理高置信 IOC" "Y"; then DO_IOC=1; else DO_IOC=0; fi
+    if ask_yn "12/12" "扫描并自动清理高置信挖矿/对外攻击 IOC" "Y"; then DO_IOC=1; else DO_IOC=0; fi
   fi
 
   out ""
@@ -387,7 +394,7 @@ apply_config() {
   if [ "$KEEP_REPORT" = "0" ]; then
     warn "你选择不保留基础上报，这等于停止 Agent。"
     if ask_yn "CONFIRM" "确认停止并禁用 nezha-agent" "N"; then
-      systemctl disable --now "$SERVICE" >> "$LOG" 2>&1
+      systemctl disable --now "$SERVICE" >/dev/null 2>&1
       ok "Agent 已停止并禁用"
       exit 0
     else
@@ -436,7 +443,7 @@ apply_config() {
     echo
     echo "--- pure probe config ---"
     grep -E '^(debug|disable_command_execute|disable_nat|disable_send_query|disable_auto_update|disable_force_update):' "$CONFIG" 2>/dev/null || true
-  } >> "$LOG"
+  } >/dev/null
 }
 
 apply_systemd_sandbox() {
@@ -484,7 +491,7 @@ AmbientCapabilities=
 ReadWritePaths=${agent_dir} ${cfg_dir}
 EOF
 
-  systemctl daemon-reload >> "$LOG" 2>&1
+  systemctl daemon-reload >/dev/null 2>&1
   SANDBOX_OK=1
   ok "systemd 隔离已写入：$dropin/10-pure-probe-hardening.conf"
   info "自动更新兼容：允许写入 ${agent_dir}"
@@ -548,7 +555,7 @@ update_agent_once() {
 
     if download "$url" "$zip" && [ -s "$zip" ]; then
       mkdir -p "$tmpd/unzip_$arch"
-      unzip -o "$zip" -d "$tmpd/unzip_$arch" >> "$LOG" 2>&1
+      unzip -o "$zip" -d "$tmpd/unzip_$arch" >/dev/null 2>&1
       newbin="$(find "$tmpd/unzip_$arch" -type f -name 'nezha-agent' 2>/dev/null | head -n1)"
 
       if [ -n "$newbin" ]; then
@@ -566,12 +573,12 @@ update_agent_once() {
     return 1
   fi
 
-  [ -n "$SERVICE" ] && systemctl stop "$SERVICE" >> "$LOG" 2>&1
-  pkill -f "$AGENT_BIN" >> "$LOG" 2>&1
+  [ -n "$SERVICE" ] && systemctl stop "$SERVICE" >/dev/null 2>&1
+  pkill -f "$AGENT_BIN" >/dev/null 2>&1
   sleep 1
 
   cp -a "$AGENT_BIN" "$AGENT_BIN.bak.${TS}" 2>/dev/null
-  install -m 755 "$newbin" "$AGENT_BIN" >> "$LOG" 2>&1
+  install -m 755 "$newbin" "$AGENT_BIN" >/dev/null 2>&1
   local rc=$?
   rm -rf "$tmpd"
 
@@ -595,6 +602,7 @@ update_agent_once() {
 
 scan_high_ioc_process() {
   : > "$HIT_PROC"
+  : > "$HIT_PIDS"
 
   ps auxww | awk '
     BEGIN { IGNORECASE=1 }
@@ -604,46 +612,23 @@ scan_high_ioc_process() {
       if (line ~ /\[kdevtmpfs\]/) next
 
       if (
-        line ~ /\/shm\/\.kworker/ ||
-        line ~ /\/dev\/shm\/\.kworker/ ||
-        line ~ /\/run\/shm\/\.kworker/ ||
-        line ~ /\/tmp\/\.kworker/ ||
-        line ~ /\/var\/tmp\/\.kworker/ ||
-        line ~ /\/tmp\/kdevtmpfsi/ ||
-        line ~ /\/var\/tmp\/kdevtmpfsi/ ||
-        line ~ /\/dev\/shm\/kdevtmpfsi/ ||
-        line ~ /\/run\/shm\/kdevtmpfsi/ ||
-        line ~ /\/tmp\/kinsing/ ||
-        line ~ /\/var\/tmp\/kinsing/ ||
-        line ~ /\/dev\/shm\/kinsing/ ||
-        line ~ /\/run\/shm\/kinsing/ ||
-        line ~ /\/tmp\/xmrig/ ||
-        line ~ /\/var\/tmp\/xmrig/ ||
-        line ~ /\/dev\/shm\/xmrig/ ||
-        line ~ /\/run\/shm\/xmrig/ ||
-        line ~ /\/tmp\/\.xmrig/ ||
-        line ~ /\/var\/tmp\/\.xmrig/ ||
-        line ~ /\/dev\/shm\/\.xmrig/ ||
-        line ~ /\/run\/shm\/\.xmrig/ ||
-        line ~ /\/tmp\/kinsingwatch/ ||
-        line ~ /\/var\/tmp\/kinsingwatch/ ||
-        line ~ /(^|[[:space:]])kworker_u8([[:space:]]|$)/ ||
-        line ~ /(^|[[:space:]])kdevtmpfsi([[:space:]]|$)/ ||
-        line ~ /(^|[[:space:]])kinsing([[:space:]]|$)/ ||
-        line ~ /(^|[[:space:]])kinsingwatch([[:space:]]|$)/ ||
-        line ~ /(^|[[:space:]])xmrig([[:space:]]|$)/
+        line ~ /\/(tmp|var\/tmp|dev\/shm|run\/shm)\/[^[:space:]]*(\.kworker|kdevtmpfsi|kinsing|kinsingwatch|xmrig|\.xmrig|xmr-stak|sysrv|perfctl|pnscan|masscan|zmap|zgrab|mirai|gafgyt|mozi|muhstik|tsunami|bashirc|dota3|dbused|\.javae|\.syst3md|\.systemd|\.httpd|\.sshd|\.watchdog|watchdogs)/ ||
+        line ~ /(^|[[:space:]])(kworker_u8|kdevtmpfsi|kinsing|kinsingwatch|xmrig|xmrig-notls|xmr-stak|sysrv|sysrv-hello|perfctl|pnscan|masscan|zmap|zgrab|mirai|gafgyt|mozi|muhstik|tsunami|bashirc|dota3|dbused)([[:space:]]|$)/ ||
+        line ~ /stratum\+tcp|pool\.[^[:space:]]*xmr|monero|cryptonight|nicehash/
       ) print line
     }
   ' > "$HIT_PROC" 2>/dev/null
 
   if [ -s "$HIT_PROC" ]; then
+    awk '{print $2}' "$HIT_PROC" | grep -E '^[0-9]+$' >> "$HIT_PIDS" 2>/dev/null
+    sort -u "$HIT_PIDS" -o "$HIT_PIDS" 2>/dev/null
     FOUND_HIGH_IOC=1
-    bad "发现高置信挖矿进程"
+    bad "发现高置信挖矿/对外攻击进程"
     out ""
     out "${B}命中进程：${C0}"
-    head -20 "$HIT_PROC" | tee -a "$LOG"
+    head -30 "$HIT_PROC"
   else
-    ok "未发现高置信挖矿进程"
+    ok "未发现高置信挖矿/对外攻击进程"
   fi
 }
 
@@ -656,40 +641,195 @@ scan_high_ioc_files() {
     /run/shm/.kworker* \
     /tmp/.kworker* \
     /var/tmp/.kworker* \
-    /tmp/kdevtmpfsi \
-    /var/tmp/kdevtmpfsi \
-    /dev/shm/kdevtmpfsi \
-    /run/shm/kdevtmpfsi \
-    /tmp/kinsing \
-    /var/tmp/kinsing \
-    /dev/shm/kinsing \
-    /run/shm/kinsing \
-    /tmp/xmrig \
-    /var/tmp/xmrig \
-    /dev/shm/xmrig \
-    /run/shm/xmrig \
-    /tmp/.xmrig \
-    /var/tmp/.xmrig \
-    /dev/shm/.xmrig \
-    /run/shm/.xmrig \
-    /tmp/kinsingwatch \
-    /var/tmp/kinsingwatch; do
+    /tmp/kdevtmpfsi* \
+    /var/tmp/kdevtmpfsi* \
+    /dev/shm/kdevtmpfsi* \
+    /run/shm/kdevtmpfsi* \
+    /tmp/kinsing* \
+    /var/tmp/kinsing* \
+    /dev/shm/kinsing* \
+    /run/shm/kinsing* \
+    /tmp/xmrig* \
+    /var/tmp/xmrig* \
+    /dev/shm/xmrig* \
+    /run/shm/xmrig* \
+    /tmp/.xmrig* \
+    /var/tmp/.xmrig* \
+    /dev/shm/.xmrig* \
+    /run/shm/.xmrig* \
+    /tmp/kinsingwatch* \
+    /var/tmp/kinsingwatch* \
+    /tmp/sysrv* \
+    /var/tmp/sysrv* \
+    /dev/shm/sysrv* \
+    /run/shm/sysrv* \
+    /tmp/perfctl* \
+    /var/tmp/perfctl* \
+    /dev/shm/perfctl* \
+    /run/shm/perfctl* \
+    /tmp/pnscan* \
+    /var/tmp/pnscan* \
+    /dev/shm/pnscan* \
+    /run/shm/pnscan* \
+    /tmp/masscan* \
+    /var/tmp/masscan* \
+    /dev/shm/masscan* \
+    /run/shm/masscan* \
+    /tmp/zmap* \
+    /var/tmp/zmap* \
+    /dev/shm/zmap* \
+    /run/shm/zmap* \
+    /tmp/zgrab* \
+    /var/tmp/zgrab* \
+    /dev/shm/zgrab* \
+    /run/shm/zgrab* \
+    /tmp/mirai* \
+    /var/tmp/mirai* \
+    /dev/shm/mirai* \
+    /run/shm/mirai* \
+    /tmp/gafgyt* \
+    /var/tmp/gafgyt* \
+    /dev/shm/gafgyt* \
+    /run/shm/gafgyt* \
+    /tmp/mozi* \
+    /var/tmp/mozi* \
+    /dev/shm/mozi* \
+    /run/shm/mozi* \
+    /tmp/muhstik* \
+    /var/tmp/muhstik* \
+    /dev/shm/muhstik* \
+    /run/shm/muhstik* \
+    /tmp/tsunami* \
+    /var/tmp/tsunami* \
+    /dev/shm/tsunami* \
+    /run/shm/tsunami* \
+    /tmp/bashirc* \
+    /var/tmp/bashirc* \
+    /dev/shm/bashirc* \
+    /run/shm/bashirc* \
+    /tmp/dota3* \
+    /var/tmp/dota3* \
+    /dev/shm/dota3* \
+    /run/shm/dota3* \
+    /tmp/dbused* \
+    /var/tmp/dbused* \
+    /dev/shm/dbused* \
+    /run/shm/dbused* \
+    /tmp/.javae* \
+    /var/tmp/.javae* \
+    /dev/shm/.javae* \
+    /run/shm/.javae* \
+    /tmp/.syst3md* \
+    /var/tmp/.syst3md* \
+    /dev/shm/.syst3md* \
+    /run/shm/.syst3md* \
+    /tmp/.systemd* \
+    /var/tmp/.systemd* \
+    /dev/shm/.systemd* \
+    /run/shm/.systemd* \
+    /tmp/.httpd* \
+    /var/tmp/.httpd* \
+    /dev/shm/.httpd* \
+    /run/shm/.httpd* \
+    /tmp/.sshd* \
+    /var/tmp/.sshd* \
+    /dev/shm/.sshd* \
+    /run/shm/.sshd* \
+    /tmp/.watchdog* \
+    /var/tmp/.watchdog* \
+    /dev/shm/.watchdog* \
+    /run/shm/.watchdog*; do
     [ -e "$f" ] && printf "%s\n" "$f" >> "$HIT_FILE"
   done
 
-  find /tmp /var/tmp /dev/shm /run/shm -maxdepth 2 -xdev 2>/dev/null | \
-    grep -Ei '(^|/)(\.kworker.*|kdevtmpfsi|kinsing|xmrig|\.xmrig|kinsingwatch)$' >> "$HIT_FILE" 2>/dev/null
+  find /tmp /var/tmp /dev/shm /run/shm -maxdepth 3 -xdev 2>/dev/null | \
+    grep -Ei "(^|/)${HIGH_TMP_NAME_REGEX}$" >> "$HIT_FILE" 2>/dev/null
 
-  sort -u "$HIT_FILE" -o "$HIT_FILE"
+  sort -u "$HIT_FILE" -o "$HIT_FILE" 2>/dev/null
 
   if [ -s "$HIT_FILE" ]; then
     FOUND_HIGH_IOC=1
-    bad "发现高置信挖矿文件"
+    bad "发现高置信挖矿/对外攻击文件"
     out ""
     out "${B}命中文件：${C0}"
-    head -30 "$HIT_FILE" | tee -a "$LOG"
+    head -50 "$HIT_FILE"
   else
-    ok "未发现高置信挖矿文件"
+    ok "未发现高置信挖矿/对外攻击文件"
+  fi
+}
+
+proc_is_tmp_or_bad() {
+  local pid="$1"
+  local exe cmd comm blob
+
+  [ -n "$pid" ] || return 1
+  [ -d "/proc/$pid" ] || return 1
+
+  exe="$(readlink "/proc/$pid/exe" 2>/dev/null)"
+  cmd="$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null)"
+  comm="$(cat "/proc/$pid/comm" 2>/dev/null)"
+  blob="$exe $cmd $comm"
+
+  printf "%s\n" "$blob" | grep -Eiq "$HIGH_PROC_NAME_REGEX" && return 0
+  printf "%s\n" "$blob" | grep -Eiq "$IOC_LINE_REGEX" && return 0
+  printf "%s\n" "$exe $cmd" | grep -Eiq '(^|[[:space:]])/(tmp|var/tmp|dev/shm|run/shm)/' && return 0
+
+  return 1
+}
+
+scan_high_ioc_network() {
+  : > "$HIT_NET"
+
+  local netout line pidlist pid hit
+  if has ss; then
+    netout="$(ss -Htanp 2>/dev/null)"
+  elif has netstat; then
+    netout="$(netstat -tanp 2>/dev/null)"
+  else
+    ok "未安装 ss/netstat，跳过外联连接扫描"
+    return 0
+  fi
+
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    hit=0
+    pidlist="$(printf "%s\n" "$line" | grep -oE 'pid=[0-9]+' | cut -d= -f2 | sort -u)"
+
+    # 进程名直接命中挖矿/扫描器/僵尸网络工具。
+    if printf "%s\n" "$line" | grep -Eiq "$HIGH_PROC_NAME_REGEX"; then
+      hit=1
+    fi
+
+    # 矿池端口命中时，再要求 PID 对应进程也可疑，避免误杀正常 8888/9999 服务。
+    if [ "$hit" = "0" ] && printf "%s\n" "$line" | grep -Eiq "$MINER_PORT_REGEX"; then
+      for pid in $pidlist; do
+        if proc_is_tmp_or_bad "$pid"; then
+          hit=1
+          break
+        fi
+      done
+    fi
+
+    if [ "$hit" = "1" ]; then
+      printf "%s\n" "$line" >> "$HIT_NET"
+      for pid in $pidlist; do
+        [ -n "$pid" ] && printf "%s\n" "$pid" >> "$HIT_PIDS"
+      done
+    fi
+  done <<EOF_NET
+$netout
+EOF_NET
+
+  sort -u "$HIT_PIDS" -o "$HIT_PIDS" 2>/dev/null
+
+  if [ -s "$HIT_NET" ]; then
+    FOUND_HIGH_IOC=1
+    bad "发现高置信挖矿/对外攻击外联"
+    out ""
+    out "${B}命中外联：${C0}"
+    head -40 "$HIT_NET"
+  else
+    ok "未发现高置信挖矿/对外攻击外联"
   fi
 }
 
@@ -732,7 +872,7 @@ scan_persistence() {
     bad "发现高置信挖矿自启动"
     out ""
     out "${B}命中自启动：${C0}"
-    head -30 "$HIT_PERSIST" | tee -a "$LOG"
+    head -30 "$HIT_PERSIST"
   else
     ok "未发现高置信挖矿自启动"
   fi
@@ -742,7 +882,7 @@ scan_persistence() {
     warn "发现中风险可疑启动项，只提示不自动删除"
     out ""
     out "${B}中风险可疑项：${C0}"
-    head -20 "$HIT_REVIEW" | tee -a "$LOG"
+    head -20 "$HIT_REVIEW"
   else
     ok "未发现中风险可疑启动项"
   fi
@@ -752,54 +892,58 @@ scan_persistence() {
     warn "发现 crontab 临时文件注释，低风险，稍后清理误报"
     out ""
     out "${B}低风险注释：${C0}"
-    head -10 "$HIT_LOW" | tee -a "$LOG"
+    head -10 "$HIT_LOW"
   fi
 }
 
-scan_context_to_log() {
-  {
-    echo
-    echo "--- last -ai ---"
-    last -ai 2>/dev/null | head -50 || true
+scan_context_brief() {
+  # 只做屏幕快速巡检，不写入任何日志文件。
+  if has ss || has netstat; then
+    info "监听端口快照（前 20 行）："
+    (ss -lntup 2>/dev/null || netstat -lntup 2>/dev/null || true) | head -20
+  fi
 
-    echo
-    echo "--- authorized_keys ---"
-    if [ -f /root/.ssh/authorized_keys ]; then
-      echo "/root/.ssh/authorized_keys"
-      nl -ba /root/.ssh/authorized_keys
-    fi
-    for ak in /home/*/.ssh/authorized_keys; do
-      [ -f "$ak" ] || continue
-      echo "$ak"
-      nl -ba "$ak"
-    done
-
-    echo
-    echo "--- listening ports ---"
-    ss -lntup 2>/dev/null || netstat -lntup 2>/dev/null || true
-
-    echo
-    echo "--- top cpu ---"
-    ps auxww --sort=-%cpu | head -20
-
-    echo
-    echo "--- top mem ---"
-    ps auxww --sort=-%mem | head -20
-  } >> "$LOG"
+  info "高 CPU 进程快照（前 10 行）："
+  ps auxww --sort=-%cpu 2>/dev/null | head -10
 }
 
 scan_ioc() {
-  title "哪吒事件高置信 IOC 扫描"
+  title "高置信挖矿/对外攻击 IOC 扫描"
   scan_high_ioc_process
+  scan_high_ioc_network
   scan_high_ioc_files
   scan_persistence
-  scan_context_to_log
-  info "登录记录、SSH Key、端口、高占用进程已写入日志"
+  scan_context_brief
+  info "扫描只在屏幕输出，不创建日志文件"
+}
+
+kill_one_pid() {
+  local pid="$1"
+  [ -n "$pid" ] || return 1
+  [ "$pid" = "$$" ] && return 1
+  [ "$pid" = "$PPID" ] && return 1
+  [ ! -d "/proc/$pid" ] && return 1
+
+  kill "$pid" >/dev/null 2>&1
+  sleep 1
+  kill -9 "$pid" >/dev/null 2>&1
+  return 0
 }
 
 kill_ioc_processes() {
   local killed=0
+  local pat pids pid
 
+  # 先杀网络扫描阶段提取到的可疑 PID。
+  if [ -s "$HIT_PIDS" ]; then
+    while IFS= read -r pid; do
+      if kill_one_pid "$pid"; then
+        killed=1
+      fi
+    done < "$HIT_PIDS"
+  fi
+
+  # 再按高置信名称/路径兜底杀一次。
   for pat in \
     '/shm/.kworker' \
     '/dev/shm/.kworker' \
@@ -824,33 +968,125 @@ kill_ioc_processes() {
     '/run/shm/.xmrig' \
     '/tmp/kinsingwatch' \
     '/var/tmp/kinsingwatch' \
+    '/tmp/sysrv' \
+    '/var/tmp/sysrv' \
+    '/dev/shm/sysrv' \
+    '/run/shm/sysrv' \
+    '/tmp/perfctl' \
+    '/var/tmp/perfctl' \
+    '/dev/shm/perfctl' \
+    '/run/shm/perfctl' \
+    '/tmp/pnscan' \
+    '/var/tmp/pnscan' \
+    '/dev/shm/pnscan' \
+    '/run/shm/pnscan' \
+    '/tmp/masscan' \
+    '/var/tmp/masscan' \
+    '/dev/shm/masscan' \
+    '/run/shm/masscan' \
+    '/tmp/zmap' \
+    '/var/tmp/zmap' \
+    '/dev/shm/zmap' \
+    '/run/shm/zmap' \
+    '/tmp/zgrab' \
+    '/var/tmp/zgrab' \
+    '/dev/shm/zgrab' \
+    '/run/shm/zgrab' \
+    '/tmp/mirai' \
+    '/var/tmp/mirai' \
+    '/dev/shm/mirai' \
+    '/run/shm/mirai' \
+    '/tmp/gafgyt' \
+    '/var/tmp/gafgyt' \
+    '/dev/shm/gafgyt' \
+    '/run/shm/gafgyt' \
+    '/tmp/mozi' \
+    '/var/tmp/mozi' \
+    '/dev/shm/mozi' \
+    '/run/shm/mozi' \
+    '/tmp/muhstik' \
+    '/var/tmp/muhstik' \
+    '/dev/shm/muhstik' \
+    '/run/shm/muhstik' \
+    '/tmp/tsunami' \
+    '/var/tmp/tsunami' \
+    '/dev/shm/tsunami' \
+    '/run/shm/tsunami' \
+    '/tmp/bashirc' \
+    '/var/tmp/bashirc' \
+    '/dev/shm/bashirc' \
+    '/run/shm/bashirc' \
+    '/tmp/dota3' \
+    '/var/tmp/dota3' \
+    '/dev/shm/dota3' \
+    '/run/shm/dota3' \
+    '/tmp/dbused' \
+    '/var/tmp/dbused' \
+    '/dev/shm/dbused' \
+    '/run/shm/dbused' \
+    '/tmp/.javae' \
+    '/var/tmp/.javae' \
+    '/dev/shm/.javae' \
+    '/run/shm/.javae' \
+    '/tmp/.syst3md' \
+    '/var/tmp/.syst3md' \
+    '/dev/shm/.syst3md' \
+    '/run/shm/.syst3md' \
+    '/tmp/.systemd' \
+    '/var/tmp/.systemd' \
+    '/dev/shm/.systemd' \
+    '/run/shm/.systemd' \
+    '/tmp/.httpd' \
+    '/var/tmp/.httpd' \
+    '/dev/shm/.httpd' \
+    '/run/shm/.httpd' \
+    '/tmp/.sshd' \
+    '/var/tmp/.sshd' \
+    '/dev/shm/.sshd' \
+    '/run/shm/.sshd' \
     'kworker_u8' \
     'kdevtmpfsi' \
     'kinsing' \
     'kinsingwatch' \
-    'xmrig'; do
-    local pids
+    'xmrig' \
+    'xmrig-notls' \
+    'xmr-stak' \
+    'sysrv' \
+    'sysrv-hello' \
+    'perfctl' \
+    'pnscan' \
+    'masscan' \
+    'zmap' \
+    'zgrab' \
+    'mirai' \
+    'gafgyt' \
+    'mozi' \
+    'muhstik' \
+    'tsunami' \
+    'bashirc' \
+    'dota3' \
+    'dbused'; do
     pids="$(pgrep -f "$pat" 2>/dev/null)"
 
     if [ -n "$pids" ]; then
-      echo "kill pattern=$pat pids=$pids" >> "$LOG"
-      kill $pids >> "$LOG" 2>&1
-      sleep 1
-      kill -9 $pids >> "$LOG" 2>&1
-      killed=1
+      for pid in $pids; do
+        if kill_one_pid "$pid"; then
+          killed=1
+        fi
+      done
     fi
   done
 
-  [ "$killed" = "1" ] && ok "已终止高置信挖矿进程" || ok "无需终止挖矿进程"
+  [ "$killed" = "1" ] && ok "已终止高置信挖矿/对外攻击进程" || ok "无需终止挖矿/对外攻击进程"
 }
 
 quarantine_rm() {
   local f="$1"
   [ -e "$f" ] || return 0
 
-  chattr -i "$f" >> "$LOG" 2>&1
-  cp -a "$f" "$QDIR/" >> "$LOG" 2>&1
-  rm -rf "$f" >> "$LOG" 2>&1
+  chattr -i "$f" >/dev/null 2>&1
+  cp -a "$f" "$QDIR/" >/dev/null 2>&1
+  rm -rf "$f" >/dev/null 2>&1
   echo "$f" >> "$QDIR/removed_files.txt"
 }
 
@@ -868,7 +1104,7 @@ clean_ioc_files() {
     done < "$HIT_FILE"
   fi
 
-  rmdir /shm >> "$LOG" 2>&1
+  rmdir /shm >/dev/null 2>&1
   [ "$removed" = "1" ] && ok "已隔离删除高置信挖矿文件" || ok "无需删除挖矿文件"
 }
 
@@ -926,13 +1162,13 @@ clean_persistence_high_ioc() {
     cp -a "$f" "$QDIR/$(echo "$f" | tr '/' '_').bak" 2>/dev/null
     local svc
     svc="$(basename "$f")"
-    systemctl disable --now "$svc" >> "$LOG" 2>&1
-    chattr -i "$f" >> "$LOG" 2>&1
-    mv "$f" "$f.disabled_by_pure_probe_${TS}" >> "$LOG" 2>&1
+    systemctl disable --now "$svc" >/dev/null 2>&1
+    chattr -i "$f" >/dev/null 2>&1
+    mv "$f" "$f.disabled_by_pure_probe_${TS}" >/dev/null 2>&1
     echo "$f" >> "$QDIR/cleaned_persist_files.txt"
   done
 
-  has systemctl && systemctl daemon-reload >> "$LOG" 2>&1
+  has systemctl && systemctl daemon-reload >/dev/null 2>&1
 
   if [ -s "$QDIR/cleaned_persist_files.txt" ]; then
     ok "已清理高置信挖矿自启动"
@@ -1028,19 +1264,18 @@ print_summary() {
   elif [ "$FOUND_LOW" = "1" ]; then
     ok "IOC 结论：只发现低风险 crontab 注释误报，已清理"
   else
-    ok "IOC 结论：未发现高置信哪吒事件常见 IOC"
+    ok "IOC 结论：未发现高置信挖矿/对外攻击 IOC"
   fi
 
   if [ "$UPDATE_OK" = "1" ]; then
     ok "升级：已执行一次 Agent 原地升级"
   elif [ "$UPDATE_FAIL" = "1" ]; then
-    bad "升级：失败，详情看日志"
+    bad "升级：失败，请手动执行 systemctl status 查看"
   else
     info "升级：本次未执行；后续靠 Agent 自动更新"
   fi
 
   out ""
-  out "日志：$LOG"
   out "隔离目录：$QDIR"
 }
 
@@ -1048,8 +1283,6 @@ main() {
   need_root
 
   out "${B}Nezha Agent 探针加固 ${C0}"
-  out "${DIM}日志：$LOG${C0}"
-
   title "识别 Agent"
   detect_agent
 
